@@ -1,6 +1,7 @@
 export type BurnerEventType = 'task' | 'habit' | 'focusTime' | 'meeting' | 'fixed' | 'buffer';
 export type SourceSystem = 'todoist' | 'canvas' | 'google' | 'manual' | 'ai-engine';
 export type EventPriority = 'critical' | 'high' | 'medium' | 'low';
+export const EVENT_PRIORITIES: EventPriority[] = ['critical', 'high', 'medium', 'low'];
 
 export interface EventPrivateProperties {
   schemaVersion: '1';

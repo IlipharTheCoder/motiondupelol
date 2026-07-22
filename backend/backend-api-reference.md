@@ -29,6 +29,7 @@ Keep this updated as new routes are added. Purpose: so building a new endpoint d
     "tags": ["string"],
     "image_url": "string",
     "status": "smallint — 0=new, 1=parsed, 2=scheduled, 3=discarded (see lib/inboxStatus.ts)",
+    "priority": "critical | high | medium | low | null — null until set via PATCH",
     "created_at": "timestamptz"
   }
 ]
@@ -57,6 +58,30 @@ Tags are normalized (trimmed, lowercased, deduped) before insert via `normalizeT
 **Response:** the newly inserted row (array, per Supabase's `.select()` behavior), same shape as `GET /api/inbox`
 
 **Errors:** `401` unauthorized, `400` if `title` is missing/empty, `500` if the insert fails
+
+---
+
+## `PATCH /api/inbox/{id}`
+
+**Auth:** required — same as above
+
+**Request:** `application/json`, every field optional — only the ones present get updated:
+```json
+{
+  "title": "string (non-empty if provided)",
+  "description": "string | null",
+  "tags": ["string (optional)"],
+  "status": "0-3, see lib/inboxStatus.ts",
+  "priority": "critical | high | medium | low | null"
+}
+```
+`tags` are freely user-defined (any string), normalized the same way as `POST /api/inbox` — trimmed, lowercased, deduped via `normalizeTags()`. `priority` reuses the same `critical`/`high`/`medium`/`low` scale used everywhere else in the system (`lib/eventMetadata.ts`'s `EVENT_PRIORITIES`); pass `null` to clear it. `image_url` and `created_at` aren't editable through this route.
+
+**What it does:** partial-updates one `inbox_items` row. At least one field must be present in the body.
+
+**Response:** the updated row, same shape as `GET /api/inbox`
+
+**Errors:** `401` unauthorized, `400` if the body has no valid fields, an empty `title`, an invalid `status`, or an invalid `priority`, `404` if no row matches `id`, `500` on a Supabase failure
 
 ---
 
@@ -126,7 +151,7 @@ There's no separate stored "all-day note vs. block" type — an all-day event (`
 
 **Request:** no body
 
-**What it does:** mirrors every calendar listed in `GOOGLE_SOURCE_CALENDAR_IDS` (comma-separated `label:calendarId` pairs, e.g. `Kids:abc...@group.calendar.google.com` — `calendarList.list()` can't be used here, since sharing a calendar with a service account never populates its `calendarList`, only its ACL permissions) into the burner calendar. Every synced event is tagged with `sourceLabel` (the configured label) and `sourceCalendarId` in its `extendedProperties.private`, so its origin calendar is always identifiable. One-way sync only (external → burner) — see `architecture-plan.md` section 2a. First run per calendar does a full backfill capped at 1 year out; subsequent runs use Google's `syncToken` for incremental deltas. Dedup and no-op-skip are driven by the `synced_events` and `calendar_sync_state` tables (see `backend-schema.md`) — safe to call repeatedly, including mid-backfill. Google write calls (`insert`/`update`/`delete`) retry with exponential backoff on rate-limit/transient errors, since bulk-writing a large first backfill reliably trips the Calendar API's write burst quota.
+**What it does:** mirrors every calendar listed in `GOOGLE_SOURCE_CALENDAR_IDS` (comma-separated `label:calendarId` pairs, e.g. `Kids:abc...@group.calendar.google.com` — `calendarList.list()` can't be used here, since sharing a calendar with a service account never populates its `calendarList`, only its ACL permissions) into the burner calendar. Every synced event is tagged with `sourceLabel` (the configured label) and `sourceCalendarId` in its `extendedProperties.private`, so its origin calendar is always identifiable. Synced events are always `flexible: 'false'` and default to `priority: 'critical'` — they're external commitments (appointments, classes, meetings) that shouldn't move and rarely need to. One-way sync only (external → burner) — see `architecture-plan.md` section 2a. First run per calendar does a full backfill capped at 1 year out; subsequent runs use Google's `syncToken` for incremental deltas. Dedup and no-op-skip are driven by the `synced_events` and `calendar_sync_state` tables (see `backend-schema.md`) — safe to call repeatedly, including mid-backfill. Google write calls (`insert`/`update`/`delete`) retry with exponential backoff on rate-limit/transient errors, since bulk-writing a large first backfill reliably trips the Calendar API's write burst quota.
 
 Bounded to ~50s of work per call (Vercel `maxDuration: 60`). If a backfill is large, a single call may not finish — check the response for `truncatedByTimeBudget: true` or any calendar with `status: "in_progress"` and call the endpoint again with no params; it resumes entirely from Supabase state.
 

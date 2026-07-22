@@ -6,16 +6,17 @@ Keep this updated as tables are added/changed. This is the source of truth Claud
 
 ## `inbox_items`
 
-Universal inbox capture items — populated by `POST /api/inbox` (plain text) and `/api/capture` (screenshot → Claude vision); will later be populated by other capture sources per `docs/backend-build-order.md` Phase 6.
+Universal inbox capture items — populated by `POST /api/inbox` (plain text) and `/api/capture` (screenshot → Claude vision); editable via `PATCH /api/inbox/{id}`; will later be populated by other capture sources per `docs/backend-build-order.md` Phase 6.
 
 | Column | Type | Notes |
 |---|---|---|
 | `id` | `uuid` | Primary key, default-generated |
 | `title` | `text` | Extracted or user-edited task title |
 | `description` | `text` | Extracted or user-edited notes |
-| `tags` | `text[]` | Always lowercase, always normalized before insert — see `normalizeTags()` (`lib/normalizeTags.ts`) |
+| `tags` | `text[]` | Always lowercase, always normalized before insert — see `normalizeTags()` (`lib/normalizeTags.ts`). Freely user-defined — any string is a valid tag, there's no fixed tag list |
 | `image_url` | `text` | Points into the `screenshots` Supabase Storage bucket. `null` for text-only entries |
 | `status` | `smallint` | **Not text** — confirmed against the live table (this doc previously said `text`, which was wrong). `0 = new`, `1 = parsed`, `2 = scheduled`, `3 = discarded` — see `lib/inboxStatus.ts` (`InboxStatus`) for the canonical mapping, reference it rather than a raw number. No formal `CHECK` constraint yet, worth adding |
+| `priority` | `text` | `null` until set (a freshly-captured item has no priority yet) — `critical`/`high`/`medium`/`low`, same `EventPriority` scale as everywhere else in the system (`lib/eventMetadata.ts`'s `EVENT_PRIORITIES`), not a separate enum |
 | `created_at` | `timestamptz` | Default `now()` |
 
 **Access:** requires `GRANT` to `service_role` (this table needed one explicitly — see the PGRST205 troubleshooting from earlier in the build).

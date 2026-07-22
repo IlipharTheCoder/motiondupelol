@@ -4,6 +4,7 @@ import {
   encodeEventMetadata,
   decodeEventMetadata,
   CATEGORY_COLORS,
+  EVENT_PRIORITIES,
   type BurnerEventType,
   type SourceSystem,
   type EventPriority,
@@ -50,7 +51,6 @@ export interface ProposedChangeRow extends ProposedChangeInput {
 
 const CHANGE_TYPES: ChangeType[] = ['create', 'move', 'update', 'delete'];
 const BURNER_EVENT_TYPES: BurnerEventType[] = ['task', 'habit', 'focusTime', 'meeting', 'fixed', 'buffer'];
-const EVENT_PRIORITIES: EventPriority[] = ['critical', 'high', 'medium', 'low'];
 
 export function validateProposalInput(input: ProposedChangeInput): void {
   if (!CHANGE_TYPES.includes(input.change_type)) {

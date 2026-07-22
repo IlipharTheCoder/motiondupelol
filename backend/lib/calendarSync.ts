@@ -373,7 +373,10 @@ async function applyPage(
           sourceId: event.id,
           sourceCalendarId: calendarId,
           sourceLabel: calendarLabel,
-          priority: 'medium',
+          // Synced events are always flexible:'false' — they're external
+          // commitments (appointments, classes, meetings) that shouldn't
+          // move, so they're critical by default rather than medium.
+          priority: 'critical',
           colorTag: CATEGORY_COLORS.meeting,
           deadline: '',
         }),
