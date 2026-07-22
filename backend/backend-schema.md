@@ -134,7 +134,51 @@ notify pgrst, 'reload schema';
 
 ---
 
+## `proposed_changes`
+
+The human-in-the-loop review queue (Phase 2 item 4) — every scheduling feature proposes into this table rather than writing to the calendar directly. See `lib/proposedChanges.ts` and `backend-api-reference.md`'s `/api/proposed-changes` routes.
+
+```sql
+create table proposed_changes (
+  id uuid primary key default gen_random_uuid(),
+  change_type text not null check (change_type in ('create','move','update','delete')),
+  category text not null check (category in ('task','habit','focusTime','meeting','fixed','buffer')),
+  flexible text check (flexible in ('true','false')),
+  source_system text not null check (source_system in ('todoist','canvas','google','manual','ai-engine')),
+  source_id text,
+  target_event_id text,
+  proposed_start timestamptz,
+  proposed_end timestamptz,
+  proposed_summary text,
+  proposed_description text,
+  priority text check (priority in ('1','2','3','4','5')),
+  color_tag text,
+  reason text,
+  status text not null default 'pending' check (status in ('pending','applied','rejected','failed')),
+  decided_by text check (decided_by in ('user','auto-apply-policy')),
+  decided_at timestamptz,
+  applied_at timestamptz,
+  error_message text,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+grant select, insert, update, delete on proposed_changes to service_role;
+notify pgrst, 'reload schema';
+```
+
+`category` reuses `BurnerEventType` and `source_system` reuses `SourceSystem` (both from `lib/eventMetadata.ts`) rather than inventing parallel enums.
+
+**Status is a 4-state machine, not 5** — deliberately no separate `approved` state. Applying a change means synchronously calling the Google Calendar API within the same request (either the approve endpoint, or immediately at creation time for a whitelisted auto-apply category), so there's no window where something is "approved but not yet applied" for a state to represent. `pending → applied | rejected | failed`; a `failed` row can be retried (re-approved) or rejected, same as `pending`.
+
+**Which fields are required depends on `change_type`** (enforced by `validateProposedChangeInput` in `lib/proposedChanges.ts`, not by a DB constraint, since the requirement is conditional): `create` needs `proposed_start`/`proposed_end`/`proposed_summary` and no `target_event_id`; `move` needs `target_event_id` + `proposed_start`/`proposed_end`; `update` needs `target_event_id` + at least one proposed field; `delete` needs only `target_event_id`.
+
+**Access:** same `GRANT` + `NOTIFY` treatment as above.
+
+**No RLS** — same reasoning as `inbox_items`/`event_metadata`.
+
+---
+
 ## Tables not yet built (coming per `docs/backend-build-order.md`)
 
-- **Proposed changes / review queue** (Phase 2) — will need: what the change is, what it affects, current approval status, timestamps. Design this fresh when you get to Phase 2 rather than retrofitting `inbox_items`'s or `event_metadata`'s shape onto it — they're not the same kind of data.
 - Any local caching of Todoist/Canvas tasks (Phase 3) — not yet designed.

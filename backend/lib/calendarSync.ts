@@ -1,7 +1,7 @@
 import type { calendar_v3 } from 'googleapis';
 import { calendar } from './googleCalendar';
 import { supabase } from './supabase';
-import { encodeEventMetadata } from './eventMetadata';
+import { encodeEventMetadata, decodeEventMetadata } from './eventMetadata';
 
 const BURNER_CALENDAR_ID = process.env.GOOGLE_BURNER_CALENDAR_ID!;
 
@@ -295,8 +295,38 @@ async function applyPage(
     mapping.set(row.source_event_id, row);
   }
 
-  const upserts: MappingRow[] = [];
-  const deleteIds: string[] = [];
+  // Each task writes its own synced_events row immediately after its own
+  // Google write succeeds, rather than collecting into a batch flushed once
+  // at the end of the page. A page can be large (up to 250 events); if the
+  // serverless function is hard-killed mid-page (Vercel's maxDuration, or a
+  // burst of write-rate-limit retries eating the time budget), a batched
+  // flush loses every successful write that came before the kill — the next
+  // run refetches the same page and recreates the same events as duplicates,
+  // since nothing on our side ever recorded they'd already been created.
+  // Per-event flushing shrinks that window from "the rest of the page" down
+  // to a single event's own two network calls.
+  async function recordUpsert(event: calendar_v3.Schema$Event, burnerEventId: string) {
+    const { error } = await supabase.from('synced_events').upsert(
+      {
+        source_calendar_id: calendarId,
+        source_event_id: event.id!,
+        burner_event_id: burnerEventId,
+        etag: event.etag ?? null,
+        source_updated_at: event.updated ?? null,
+      },
+      { onConflict: 'source_calendar_id,source_event_id' }
+    );
+    if (error) throw new Error(`synced_events upsert failed: ${error.message}`);
+  }
+
+  async function recordDelete(event: calendar_v3.Schema$Event) {
+    const { error } = await supabase
+      .from('synced_events')
+      .delete()
+      .eq('source_calendar_id', calendarId)
+      .eq('source_event_id', event.id!);
+    if (error) throw new Error(`synced_events delete failed: ${error.message}`);
+  }
 
   const tasks = events.map((event) => async () => {
     if (!event.id) return;
@@ -318,8 +348,8 @@ async function applyPage(
         const status = errorStatusCode(err);
         if (status !== 404 && status !== 410) throw err;
       }
+      await recordDelete(event);
       deleted++;
-      deleteIds.push(event.id);
       return;
     }
 
@@ -349,16 +379,6 @@ async function applyPage(
       },
     };
 
-    const recordUpsert = (burnerEventId: string) => {
-      upserts.push({
-        source_calendar_id: calendarId,
-        source_event_id: event.id!,
-        burner_event_id: burnerEventId,
-        etag: event.etag ?? null,
-        source_updated_at: event.updated ?? null,
-      });
-    };
-
     if (existing) {
       try {
         const { data } = await withRetry(() =>
@@ -368,46 +388,27 @@ async function applyPage(
             requestBody,
           })
         );
+        await recordUpsert(event, data.id!);
         updated++;
-        recordUpsert(data.id!);
       } catch (err) {
         if (errorStatusCode(err) !== 404) throw err;
         // Burner event was deleted out-of-band — self-heal via insert.
         const { data } = await withRetry(() =>
           calendar.events.insert({ calendarId: BURNER_CALENDAR_ID, requestBody })
         );
+        await recordUpsert(event, data.id!);
         created++;
-        recordUpsert(data.id!);
       }
     } else {
       const { data } = await withRetry(() =>
         calendar.events.insert({ calendarId: BURNER_CALENDAR_ID, requestBody })
       );
+      await recordUpsert(event, data.id!);
       created++;
-      recordUpsert(data.id!);
     }
   });
 
   const taskErrors = await runInBatches(tasks, GOOGLE_WRITE_CONCURRENCY);
-
-  // Flush every successful write before surfacing any failure — a partial
-  // page (some tasks failed after exhausting retries) must not lose the
-  // tasks that did succeed.
-  if (upserts.length > 0) {
-    const { error } = await supabase
-      .from('synced_events')
-      .upsert(upserts, { onConflict: 'source_calendar_id,source_event_id' });
-    if (error) throw new Error(`synced_events upsert failed: ${error.message}`);
-  }
-
-  if (deleteIds.length > 0) {
-    const { error } = await supabase
-      .from('synced_events')
-      .delete()
-      .eq('source_calendar_id', calendarId)
-      .in('source_event_id', deleteIds);
-    if (error) throw new Error(`synced_events delete failed: ${error.message}`);
-  }
 
   if (taskErrors.length > 0) {
     throw taskErrors[0];
@@ -562,5 +563,99 @@ export async function runSync(): Promise<SyncRunResult> {
     durationMs: finishedAt - startedAt,
     truncatedByTimeBudget,
     calendars,
+  };
+}
+
+export interface DedupeResult {
+  groupsScanned: number;
+  groupsWithDuplicates: number;
+  eventsDeleted: number;
+  errors: string[];
+}
+
+// Maintenance tool: collapses burner-calendar events that were duplicated by
+// a mid-page kill under the old batched-flush behavior (see the comment on
+// recordUpsert/recordDelete above) — or by any other future cause that
+// produces more than one burner event for the same source event. Keyed off
+// the same extendedProperties every synced event already carries, so it
+// needs no separate bookkeeping of its own.
+export async function dedupeBurnerEvents(): Promise<DedupeResult> {
+  let events: calendar_v3.Schema$Event[] = [];
+  let pageToken: string | undefined;
+  do {
+    const { data } = await withRetry(() =>
+      calendar.events.list({
+        calendarId: BURNER_CALENDAR_ID,
+        singleEvents: true,
+        showDeleted: false,
+        maxResults: PAGE_SIZE,
+        pageToken,
+      })
+    );
+    events = events.concat(data.items ?? []);
+    pageToken = data.nextPageToken ?? undefined;
+  } while (pageToken);
+
+  const groups = new Map<string, calendar_v3.Schema$Event[]>();
+  for (const event of events) {
+    const meta = decodeEventMetadata(event.extendedProperties);
+    if (!meta.sourceId || !meta.sourceCalendarId) continue; // never touch untagged/manual events
+    const key = `${meta.sourceCalendarId}::${meta.sourceId}`;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key)!.push(event);
+  }
+
+  const dupeGroups = [...groups.entries()].filter(([, list]) => list.length > 1);
+  let eventsDeleted = 0;
+
+  const tasks = dupeGroups.map(([key, group]) => async () => {
+    const [sourceCalendarId, sourceId] = key.split('::');
+    const { data: mappingRow, error: mappingError } = await supabase
+      .from('synced_events')
+      .select('*')
+      .eq('source_calendar_id', sourceCalendarId)
+      .eq('source_event_id', sourceId)
+      .maybeSingle();
+    if (mappingError) throw new Error(`synced_events read failed for ${key}: ${mappingError.message}`);
+
+    let canonical = mappingRow ? group.find((e) => e.id === mappingRow.burner_event_id) : undefined;
+
+    if (!canonical) {
+      // Mapping missing or pointing at a copy that no longer exists in this
+      // group — fall back to the most-recently-updated copy and repoint
+      // synced_events at it.
+      canonical = [...group].sort((a, b) => (b.updated ?? '').localeCompare(a.updated ?? ''))[0];
+      const { error } = await supabase.from('synced_events').upsert(
+        {
+          source_calendar_id: sourceCalendarId,
+          source_event_id: sourceId,
+          burner_event_id: canonical.id!,
+          etag: canonical.etag ?? null,
+          source_updated_at: canonical.updated ?? null,
+        },
+        { onConflict: 'source_calendar_id,source_event_id' }
+      );
+      if (error) throw new Error(`synced_events repoint failed for ${key}: ${error.message}`);
+    }
+
+    for (const event of group) {
+      if (event.id === canonical.id) continue;
+      try {
+        await withRetry(() => calendar.events.delete({ calendarId: BURNER_CALENDAR_ID, eventId: event.id! }));
+        eventsDeleted++;
+      } catch (err) {
+        const status = errorStatusCode(err);
+        if (status !== 404 && status !== 410) throw err;
+      }
+    }
+  });
+
+  const taskErrors = await runInBatches(tasks, GOOGLE_WRITE_CONCURRENCY);
+
+  return {
+    groupsScanned: groups.size,
+    groupsWithDuplicates: dupeGroups.length,
+    eventsDeleted,
+    errors: taskErrors.map((err) => (err instanceof Error ? err.message : String(err))),
   };
 }

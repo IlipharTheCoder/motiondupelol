@@ -140,6 +140,30 @@ Bounded to ~50s of work per call (Vercel `maxDuration: 60`). If a backfill is la
 
 **Errors:** `401` if unauthorized, `500` with `{ "error": message }` only for a run-level failure (e.g. calendar discovery itself couldn't reach Google). A single calendar failing mid-sync does **not** fail the request — it's reported as `status: "error"` with `errorMessage` set on that calendar's entry, response is still `200`.
 
+**Note:** each event's `synced_events` mapping is now written immediately after its own Google write succeeds, not batched and flushed once at the end of a page — a batched flush meant a mid-page function kill (Vercel `maxDuration`, or a burst of write-rate-limit retries) could lose every successful write that came before the kill, causing the same page to be recreated as duplicates on the next run. See `POST /api/calendar/sync/dedupe` below for cleaning up any duplicates this already produced.
+
+---
+
+## `POST /api/calendar/sync/dedupe`
+
+**Auth:** required — `x-api-key` header must match `APP_SECRET_KEY`
+
+**Request:** no body
+
+**What it does:** maintenance endpoint — scans every event on the burner calendar, groups them by the `(sourceCalendarId, sourceId)` pair already tagged in `extendedProperties.private` (untagged/manual events are never touched), and for any group with more than one event, keeps the copy `synced_events` currently points at (or the most-recently-updated copy if the mapping is missing/stale, repointing `synced_events` to it) and deletes the rest. Safe to call repeatedly — a clean calendar returns `groupsWithDuplicates: 0, eventsDeleted: 0`. Deletes go through the same `withRetry`/concurrency-limited machinery as `POST /api/calendar/sync`, since a large cleanup can trip the same Calendar API write rate limit.
+
+**Response:**
+```json
+{
+  "groupsScanned": 52,
+  "groupsWithDuplicates": 0,
+  "eventsDeleted": 0,
+  "errors": ["string"]
+}
+```
+
+**Errors:** `401` if unauthorized, `500` with `{ "error": message }` on a run-level failure. A single group's cleanup failing does not fail the request — its error is collected into `errors` and other groups still get processed.
+
 ---
 
 ## `GET /api/calendar/free-slots`
@@ -187,7 +211,82 @@ Bounded to ~50s of work per call (Vercel `maxDuration: 60`). If a backfill is la
 
 ---
 
+## `GET /api/proposed-changes`
+
+**Auth:** required — same as above
+
+**Query params:** `status` (optional — one of `pending`/`applied`/`rejected`/`failed`; omit to return all rows)
+
+**What it does:** lists rows from `proposed_changes` (see `backend-schema.md`), newest first. This is the human-in-the-loop review queue every scheduling feature writes into instead of touching the calendar directly.
+
+**Response:** array of `proposed_changes` rows (see schema for full shape)
+
+**Errors:** `401` unauthorized, `400` if `status` isn't a valid value, `500` on a Supabase failure
+
+---
+
+## `POST /api/proposed-changes`
+
+**Auth:** required — same as above
+
+**Request:** `application/json`, shape depends on `change_type`:
+```json
+{
+  "change_type": "create | move | update | delete",
+  "category": "task | habit | focusTime | meeting | fixed | buffer",
+  "flexible": "true | false (optional)",
+  "source_system": "todoist | canvas | google | manual | ai-engine",
+  "source_id": "string (optional)",
+  "target_event_id": "string (required for move/update/delete, must be absent for create)",
+  "proposed_start": "ISO datetime (required for create/move)",
+  "proposed_end": "ISO datetime (required for create/move)",
+  "proposed_summary": "string (required for create)",
+  "proposed_description": "string (optional)",
+  "priority": "1-5 (optional)",
+  "color_tag": "string (optional)",
+  "reason": "string (optional, human-readable justification)"
+}
+```
+`update` requires `target_event_id` plus at least one of `proposed_start`/`proposed_end`/`proposed_summary`/`proposed_description`/`priority`/`color_tag`.
+
+**What it does:** validates the input for its `change_type` (`lib/proposedChanges.ts`'s `validateProposalInput`), inserts a `pending` row, then checks `category` against the `AUTO_APPLY_CATEGORIES` env var (comma-separated `BurnerEventType` list, e.g. `habit,buffer`; empty/unset means nothing auto-applies). If `category` is whitelisted, the change is applied to the calendar immediately in the same request — the response reflects the final `applied`/`failed` state, not `pending`.
+
+Applying (whether via auto-apply here or via the `approve` endpoint below) re-checks for conflicts on `create`/`move` using `detectConflicts` (`GET /api/calendar/conflicts`'s underlying function) — a conflict fails the change (`status: "failed"`, descriptive `error_message`) rather than double-booking. `create` builds `extendedProperties.private` via `encodeEventMetadata`; `update` reads the existing event first and merges changed fields into its metadata (Google's `patch` replaces the whole `extendedProperties.private` map rather than merging individual keys, so the full map is always resent).
+
+**Response:** the created/updated `proposed_changes` row
+
+**Errors:** `401` unauthorized, `400` on a validation failure, `500` on a Supabase or unexpected failure
+
+---
+
+## `POST /api/proposed-changes/{id}/approve`
+
+**Auth:** required — same as above
+
+**Request:** no body
+
+**What it does:** applies a `pending` or `failed` proposed change to the calendar (see the application logic described above). Retrying a previously `failed` change is just approving it again.
+
+**Response:** the updated row, `status: "applied"` (with `target_event_id` set to the resulting burner event, for `create`) or `status: "failed"` (with `error_message` set)
+
+**Errors:** `401` unauthorized, `404` if no row matches `id`, `409` if the row's `status` isn't `pending` or `failed` (already `applied`/`rejected`), `500` on a Google API or Supabase failure
+
+---
+
+## `POST /api/proposed-changes/{id}/reject`
+
+**Auth:** required — same as above
+
+**Request:** no body
+
+**What it does:** marks a `pending` or `failed` proposed change as `rejected` — no calendar write happens. Rejecting a `failed` change is an alternative to retrying it via `approve`.
+
+**Response:** the updated row, `status: "rejected"`
+
+**Errors:** `401` unauthorized, `404` if no row matches `id`, `409` if the row's `status` isn't `pending` or `failed`, `500` on a Supabase failure
+
+---
+
 ## Not yet built
 
-- Proposed-changes endpoints (create/approve/reject) — Phase 2
 - Task/habit/focus-time endpoints — Phase 3

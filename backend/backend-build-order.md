@@ -24,20 +24,21 @@ The immediate next step — everything after this depends on it actually working
 
 1. ✅ **Done.** **`GET /api/calendar/events`** — list events from the burner calendar using the service account credentials. No scheduling logic yet, just proves the auth chain works end to end (table #19). Implemented via `lib/googleCalendar.ts` (shared JWT client, full `calendar` scope) + `app/api/calendar/events/route.ts`; verified locally against the real burner calendar.
 2. ✅ **Done.** **External → burner sync engine** — using `syncToken` for incremental updates and `extendedProperties` source-ID tagging for dedup, per the design already locked into `architecture-plan.md` section 2a (table #19, #20). Implemented via `lib/calendarSync.ts` + `lib/eventMetadata.ts` + `POST /api/calendar/sync`, backed by two new Supabase tables (`calendar_sync_state`, `synced_events`) for resumable, efficient dedup. Source calendars are configured via `GOOGLE_SOURCE_CALENDAR_IDS` (`calendarList.list()` doesn't work for service accounts — see `architecture-plan.md` section 2a), each tagged with a `sourceLabel`; first backfill per calendar capped 1 year out; Google writes retry with backoff to survive the Calendar API's write burst quota. Verified end-to-end against 5 real calendars — full backfill, idempotent re-run (steady-state incremental, zero changes), and correct `sourceLabel` tagging all confirmed.
+   - **Bug found & fixed (2026-07-22):** a batched end-of-page `synced_events` flush meant a mid-page function kill could lose already-successful Google writes, causing the next sync to recreate the same events as duplicates — 121 orphaned duplicates were produced this way in one source calendar. Fixed by flushing each event's `synced_events` row immediately after its own Google write succeeds. A maintenance endpoint, `POST /api/calendar/sync/dedupe`, was added to clean up existing duplicates (and any future ones) — see `backend-api-reference.md`. Verified: cleanup ran to zero duplicates, and a subsequent sync produced `created: 0` across all calendars.
 
 ## Phase 2 — The shared primitive + the safety pattern
 
 Build these before any feature that writes to the calendar — everything in Phase 3 is "apply this primitive with different constraints," and nothing should auto-write without the review queue existing first.
 
 3. ✅ **Done.** **Free-slot finding / conflict detection** (table #1, #2) — the one piece of logic that tasks, habits, focus time, buffer insertion, and the booking page will all reuse. Worth over-investing in correctness here specifically. Implemented as a clean pure/IO split: `lib/intervals.ts` (pure interval math — merge/subtract/pad/filter, unit-tested), `lib/workingHours.ts` (DST-correct working-window generation via `luxon`, unit-tested including real spring-forward/fall-back transitions), `lib/busyIntervals.ts` (Google fetch + per-event-timezone normalization, unit-tested), `lib/freeSlots.ts` (`findFreeSlots`/`detectConflicts` orchestration), `lib/schedulingConfig.ts` (`HOME_TIMEZONE`/`WORKING_HOURS_START`/`WORKING_HOURS_END`/`WORKING_DAYS` env vars, defaults `America/New_York` 10:00–18:00 Mon–Fri). Exposed via `GET /api/calendar/free-slots` and `GET /api/calendar/conflicts` for verification against the real burner calendar. 47 unit tests (`npm test`), every non-cancelled burner event counts as busy regardless of `flexible` tag — deciding what to do about conflicts is explicitly deferred to item 5.
-4. **Proposed-changes / review queue** — a data model (separate from calendar events) plus approve/reject endpoints. This is the human-in-the-loop mechanism from the spec's AI Assistant section — every scheduling feature from here on proposes into this queue rather than writing directly.
+4. ✅ **Done.** **Proposed-changes / review queue** — a data model (separate from calendar events) plus approve/reject endpoints. This is the human-in-the-loop mechanism from the spec's AI Assistant section — every scheduling feature from here on proposes into this queue rather than writing directly. Implemented via a new `proposed_changes` Supabase table + `lib/proposedChanges.ts` + `GET/POST /api/proposed-changes` + `POST /api/proposed-changes/{id}/approve|reject`. Per-`change_type` field validation (`create`/`move`/`update`/`delete`); a 4-state status machine (`pending → applied | rejected | failed`, no separate "approved" state since applying happens synchronously); an `AUTO_APPLY_CATEGORIES` whitelist env var (empty/unset = nothing auto-applies, per your explicit choice to build this now rather than defer it) that applies a proposal immediately at creation time instead of waiting for approval; a conflict recheck via `detectConflicts` (item 3's primitive) on every `create`/`move` apply, failing safe with a descriptive error rather than double-booking. Verified end-to-end against the real burner calendar: manual approve, auto-apply (both success and a real-conflict failure), reject, retry-from-failed, and 409s on already-decided rows.
 5. **Auto-reschedule on conflict** (table #3) — mechanical once #3 and #4 exist: detect overlap, propose a move, wait for approval.
 
 ## Phase 3 — Feature layers, built on the primitive
 
 Each of these is meaningfully smaller than it looks, because #3 above already did the hard part.
 
-6. **Todoist task sync** (table #21) — external data has to exist before there's anything to schedule.
+6. **Todoist task sync** (table #21) — external data has to exist before there's anything to schedule. New/changed items land in the review queue from Phase 2 (item 4) for approval before entering the task list — see `docs/architecture-plan.md` section 4a.
 7. **AI Tasks** — auto-placement into free slots, deadline-aware backward planning, session-splitting for large tasks, basic "what should I work on next" as a priority-score sort (table #4, #5, #7, #18).
 8. **AI Habits** — best-time placement, reflow on conflict (table #6).
 9. **AI Focus Time** — weekly goal tracking, auto-defend blocks, Deep Work Index as a computed stat (table #8, #9).
@@ -48,7 +49,7 @@ Each of these is meaningfully smaller than it looks, because #3 above already di
 
 Lower urgency — nothing else depends on these.
 
-12. **Canvas sync** (table #22)
+12. **Canvas sync** (table #22) — same review-queue gating as Todoist, item 6
 13. **Labels** (table #14)
 14. **Bulk actions** (table #15)
 15. **Weekly time-spend reports** (table #13)
@@ -67,13 +68,9 @@ Explicitly parked, not forgotten:
 
 - **AI Scheduling Links** (Calendly-style booking pages) — reuses the Phase 2 slot-finder, but is public-facing and has its own hosting/security surface; do it once the core engine is trustworthy, not before
 - **Quick Capture screenshot parsing** — already built (`/api/capture`), just not wired into anything downstream yet
-- **Quick Capture from other sources** (web clipper, Gmail) — additional inbox intake methods, not core to scheduling
+- **Quick Capture from other sources** — web clipper still open; **Gmail no longer needs the Gmail API** — use inbound email forwarding (Postmark/Mailgun/Cloudflare Email Routing → webhook → `/api/capture`'s existing pipeline) instead. No OAuth, no polling, no Gmail credentials at all — see `docs/architecture-plan.md` section 4a.
 - **Two-way sync back to Todoist/Canvas** — optional per the spec's own notes; only build if you find yourself wanting task-completion status to flow back
 - **MCP server / Claude app exposure** — nice-to-have reachability, not core functionality
 - **"Scheduling policies"** — still flagged from the original spec as likely cuttable for a solo build
 
 ---
-
-## What to hand Claude right now
-
-Phase 2, item 3 (free-slot finding / conflict detection) is done. Next up is item 4 — the proposed-changes/review queue, the human-in-the-loop mechanism every scheduling feature from here on writes through instead of the calendar directly.
