@@ -73,11 +73,17 @@ flexible: "true" | "false"
 sourceSystem: "todoist" | "canvas" | "google" | "manual" | "ai-engine"
 sourceId: "<external ID, or empty string>"
 sourceCalendarId: "<external calendar ID this came from, or empty string>"
-priority: "1".."5"
-colorTag: "deep-work"
+sourceLabel: "<human-chosen label for the source calendar, or empty string>"
+priority: "critical" | "high" | "medium" | "low"
+colorTag: "<hex color, derived from type — never freely chosen>"
+deadline: "<ISO datetime \"must be done by\", or empty string>"
 ```
 
 **Update (sync engine, Phase 1 item 2):** added `sourceCalendarId` to the shape above. The sync engine's dedup pair is `{sourceCalendarId, sourceEventId}` — `sourceEventId` reuses the existing generic `sourceId` field rather than introducing a parallel structure, so `sourceCalendarId` is the one new key needed to complete that pair. Non-synced events (manual/ai-engine-created) just leave it `""`, same as `sourceId` already does for those. See `lib/eventMetadata.ts` for the canonical encode/decode module implementing this shape.
+
+**Update (Phase 2 item 4 follow-up, 2026-07-22):** `priority` was originally a numeric `"1".."5"` scale; changed to `critical`/`high`/`medium`/`low` to match how the user actually thinks about events (e.g. doctors' appointments and classes are `critical`) rather than an arbitrary number. `colorTag` was originally a free-form/optional field; it's now always derived from `type` via `lib/eventMetadata.ts`'s `CATEGORY_COLORS` map, so it's never blank and never needs to be chosen by a caller — this also resolves the "Color-tag scheme" open question below, at least for the app-side metadata tag (whether to *additionally* set Google's own native `colorId` so the event's color shows up inside Google Calendar's own UI is still open, and not needed for anything built so far). `deadline` is new: a "must be done by" constraint that travels with an event but is independent of `proposed_start`/`proposed_end` (where it's actually scheduled) — no logic reads it yet.
+
+**Note vs. block, clarified (2026-07-22):** there's no separate stored "kind" field distinguishing an all-day note (birthdays, first-day-of-school) from a timed block. All-day-ness is already visible from whether an event uses `start.date` (note) or `start.dateTime` (block) — `lib/busyIntervals.ts` already makes exactly this distinction for scheduling purposes (`isAllDay`). `priority` simply isn't meaningful for a note; nothing enforces that today, it's just never read for all-day events.
 
 Keeping these as individual flat keys (rather than one JSON blob) also matters for a second reason: Google's API supports server-side filtering via `privateExtendedProperty=type=task` in an `Events.list` request — but only as an exact match on a whole flat key, never as a query into a nested JSON string. Anything you'll ever want filtered by the API itself has to be a flat key regardless of the truncation issue.
 
@@ -208,7 +214,7 @@ Every backend route except `/api/health` checks for a shared secret via an `isAu
 ## 7. Open questions before you start building
 
 - **Sync cadence** — is a 10–15 min cron loop tight enough, or do you want Google Calendar push notifications (webhooks) for near-real-time updates when something changes? (Push is more responsive but more setup; cron is simpler and probably fine for a personal tool.)
-- **Approval UX** — does every single proposed change need explicit approval, or do you want to whitelist some categories (e.g., habit reflows) to auto-apply while task/meeting changes always need a tap?
+- ~~**Approval UX**~~ — resolved (Phase 2 item 4): `AUTO_APPLY_CATEGORIES` env var whitelists categories to auto-apply immediately; everything else sits `pending` for a tap.
 - **Inbox triage UI** — does the parsed screenshot text get a dedicated review screen, or does it just appear inline wherever proposed calendar changes show up?
-- **Color-tag scheme** — worth defining the actual `colorTag` → Google `colorId` mapping now, since it touches both the engine and the booking page display.
+- ~~**Color-tag scheme**~~ — resolved for the app-side metadata tag: `colorTag` is always derived from `type` via a fixed hex-color map (`lib/eventMetadata.ts`'s `CATEGORY_COLORS`), never freely chosen. Still open: whether to *also* set Google's native `colorId` so the color shows up inside Google Calendar's own UI, not just the app's — not needed for anything built so far.
 - **Auth for your own apps talking to the backend** — even for a personal project, the Mac/iPhone apps need some way to authenticate to your Vercel backend (simple API key/token is enough at this scale — no need for full OAuth infrastructure between your own components).

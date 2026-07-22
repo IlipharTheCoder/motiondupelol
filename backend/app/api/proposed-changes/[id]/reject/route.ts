@@ -1,5 +1,10 @@
 import { isAuthorized } from '@/lib/auth';
-import { rejectProposedChange, ConflictError, NotFoundError } from '@/lib/proposedChanges';
+import {
+  rejectProposedChange,
+  describeProposalOutcome,
+  ConflictError,
+  NotFoundError,
+} from '@/lib/proposedChanges';
 
 export async function POST(request: Request, { params }: { params: Promise<{ id: string }> }) {
   if (!isAuthorized(request)) {
@@ -10,7 +15,7 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
 
   try {
     const row = await rejectProposedChange(id);
-    return Response.json(row);
+    return Response.json({ ...row, message: describeProposalOutcome(row) });
   } catch (error) {
     if (error instanceof NotFoundError) {
       return Response.json({ error: error.message }, { status: 404 });

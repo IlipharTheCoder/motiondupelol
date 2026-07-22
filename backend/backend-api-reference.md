@@ -80,27 +80,43 @@ Tags are normalized (trimmed, lowercased, deduped) before insert via `normalizeT
 
 **Auth:** required — `x-api-key` header must match `APP_SECRET_KEY`
 
-**What it does:** lists upcoming events from the burner calendar (`GOOGLE_BURNER_CALENDAR_ID`) via the Google Calendar API, authenticated as the service account (`lib/googleCalendar.ts`). Read-only proof that the auth chain works — no scheduling logic, no writes.
+**What it does:** lists events from the burner calendar (`GOOGLE_BURNER_CALENDAR_ID`) via the Google Calendar API, authenticated as the service account (`lib/googleCalendar.ts`).
 
-**Query behavior:** `timeMin` = now, `singleEvents: true`, `orderBy: 'startTime'`, `maxResults: 50`. Not yet configurable via query params.
+**Query params (all optional — omitting all of them reproduces the original fixed behavior: upcoming events from now, 50 max):**
+- `from`/`to` (ISO datetimes) — override the default `timeMin: now` and add a `timeMax`. `400` if either fails to parse, or if `to` isn't later than `from`.
+- `maxResults` (positive integer, default `50`, capped at Google's own ceiling of `2500`) — `400` if not a positive integer or over the cap.
+- `pageToken` (opaque string from a previous response's `nextPageToken`) — continue a previous listing.
+- `q` (string) — passed straight through to Google's own full-text search across `summary`/`description`/`location`/attendee fields. This is substring/fuzzy matching, not a strict exact-match filter — "look up an event by name" works, but isn't guaranteed to match *only* that event.
 
-**Response:** array of events, mapped down from Google's raw event objects
+**Response:** `{ events: [...], nextPageToken: string | null }`. Each event is mapped down from Google's raw event object; `category`/`priority`/`deadline`/`colorTag`/`origin` are decoded from `extendedProperties.private` (`lib/eventMetadata.ts`) — `null` for any event that predates a given field (e.g. events synced before `deadline` existed) or that didn't originate from this system at all.
 ```json
-[
-  {
-    "id": "string",
-    "summary": "string",
-    "description": "string | null",
-    "location": "string | null",
-    "start": { "dateTime": "string", "timeZone": "string" },
-    "end": { "dateTime": "string", "timeZone": "string" },
-    "status": "string",
-    "htmlLink": "string"
-  }
-]
+{
+  "events": [
+    {
+      "id": "string",
+      "summary": "string",
+      "description": "string | null",
+      "location": "string | null",
+      "start": { "dateTime": "string", "timeZone": "string" },
+      "end": { "dateTime": "string", "timeZone": "string" },
+      "status": "string",
+      "htmlLink": "string",
+      "category": "task | habit | focusTime | meeting | fixed | buffer | null",
+      "priority": "critical | high | medium | low | null",
+      "deadline": "timestamptz | null",
+      "colorTag": "string (hex color, derived from category) | null",
+      "origin": {
+        "sourceSystem": "todoist | canvas | google | manual | ai-engine | null",
+        "sourceLabel": "string | null"
+      }
+    }
+  ],
+  "nextPageToken": "string | null"
+}
 ```
+There's no separate stored "all-day note vs. block" type — an all-day event (`start.date` instead of `start.dateTime`) is just an event whose `priority` isn't meaningful; whether it's all-day is already visible from `start`/`end`'s shape.
 
-**Errors:** `401` if unauthorized, `500` with `{ "error": message }` if the Google Calendar API call fails (bad credentials, calendar not shared, etc.)
+**Errors:** `401` if unauthorized, `400` on any invalid query param (see above), `500` with `{ "error": message }` if the Google Calendar API call fails (bad credentials, calendar not shared, etc.)
 
 ---
 
@@ -211,6 +227,37 @@ Bounded to ~50s of work per call (Vercel `maxDuration: 60`). If a backfill is la
 
 ---
 
+## `POST /api/calendar/reschedule`
+
+**Auth:** required — `x-api-key` header must match `APP_SECRET_KEY`
+
+**Query params:** `from`/`to` (optional ISO datetimes — default `from: now`, `to: from + 14 days`). `400` if either fails to parse or `to` isn't later than `from`.
+
+**What it does:** scans `[from, to)` for overlapping burner events and proposes a `move` (into `proposed_changes`, via `lib/autoReschedule.ts`) for the flexible side of each conflict it can resolve — it never writes to the calendar directly, same as everything else built on the review queue. Policy, in order:
+- Movability comes from an event's own `flexible` metadata, not its `category`. Two non-flexible events conflicting is unresolvable — reported in the summary, no proposal made.
+- If both sides of a conflict are flexible, the **lower-priority one moves** (`critical` > `high` > `medium` > `low`); exact ties break on `eventId` comparison — arbitrary but deterministic, so re-running doesn't flip which side moves.
+- The replacement slot is the first opening `findFreeSlots` returns (respecting working hours) at least as long as the event's own current duration, searched within the same `[from, to)` window (clamped to not start before now). No proposal is made if nothing fits.
+- Won't create a duplicate: if a `pending` or `failed` `move` proposal already targets that event, it's skipped. An event already conflicting with several others in the window still only gets one proposal, listing every conflict in `reason`.
+- Goes through the normal `createProposedChange` path, so a whitelisted `AUTO_APPLY_CATEGORIES` category still applies immediately instead of staying `pending`.
+
+**Response:**
+```json
+{
+  "eventsScanned": 0,
+  "conflictingPairs": 0,
+  "proposalsCreated": 0,
+  "skippedAlreadyPending": 0,
+  "unresolvedBothFixed": 0,
+  "noSlotAvailable": 0,
+  "proposals": []
+}
+```
+`proposals` is the array of newly-created `proposed_changes` rows (see `GET /api/proposed-changes`'s response shape) — already-pending duplicates skipped this run aren't included since nothing new happened for them.
+
+**Errors:** `401` unauthorized, `400` on an invalid `from`/`to`, `500` on a Google API or Supabase failure. On-demand only — nothing in this backend runs on a schedule yet (no Vercel Cron wired up), so this has to be called explicitly for now.
+
+---
+
 ## `GET /api/proposed-changes`
 
 **Auth:** required — same as above
@@ -242,18 +289,20 @@ Bounded to ~50s of work per call (Vercel `maxDuration: 60`). If a backfill is la
   "proposed_end": "ISO datetime (required for create/move)",
   "proposed_summary": "string (required for create)",
   "proposed_description": "string (optional)",
-  "priority": "1-5 (optional)",
-  "color_tag": "string (optional)",
+  "priority": "critical | high | medium | low (optional, default medium)",
+  "deadline": "ISO datetime (optional) — a \"must be done by\" constraint, independent of proposed_start/proposed_end",
   "reason": "string (optional, human-readable justification)"
 }
 ```
-`update` requires `target_event_id` plus at least one of `proposed_start`/`proposed_end`/`proposed_summary`/`proposed_description`/`priority`/`color_tag`.
+`update` requires `target_event_id` plus at least one of `proposed_start`/`proposed_end`/`proposed_summary`/`proposed_description`/`priority`/`deadline`.
+
+Note there's no `color_tag` input — color is always derived from `category` (`lib/eventMetadata.ts`'s `CATEGORY_COLORS`), never freely chosen, so it's never blank. The response's `color_tag` reflects this even on a still-`pending` row (useful for a review-queue UI to show the right color before approval).
 
 **What it does:** validates the input for its `change_type` (`lib/proposedChanges.ts`'s `validateProposalInput`), inserts a `pending` row, then checks `category` against the `AUTO_APPLY_CATEGORIES` env var (comma-separated `BurnerEventType` list, e.g. `habit,buffer`; empty/unset means nothing auto-applies). If `category` is whitelisted, the change is applied to the calendar immediately in the same request — the response reflects the final `applied`/`failed` state, not `pending`.
 
-Applying (whether via auto-apply here or via the `approve` endpoint below) re-checks for conflicts on `create`/`move` using `detectConflicts` (`GET /api/calendar/conflicts`'s underlying function) — a conflict fails the change (`status: "failed"`, descriptive `error_message`) rather than double-booking. `create` builds `extendedProperties.private` via `encodeEventMetadata`; `update` reads the existing event first and merges changed fields into its metadata (Google's `patch` replaces the whole `extendedProperties.private` map rather than merging individual keys, so the full map is always resent).
+Applying (whether via auto-apply here or via the `approve` endpoint below) re-checks for conflicts on `create`/`move` using `detectConflicts` (`GET /api/calendar/conflicts`'s underlying function) — a conflict fails the change (`status: "failed"`, descriptive `error_message`) rather than double-booking. `create` builds `extendedProperties.private` via `encodeEventMetadata`; `update` reads the existing event first and merges changed fields into its metadata (Google's `patch` replaces the whole `extendedProperties.private` map rather than merging individual keys, so the full map is always resent) — `color_tag` is re-derived from whichever category ends up written, not preserved from the stale row.
 
-**Response:** the created/updated `proposed_changes` row
+**Response:** the created/updated `proposed_changes` row, plus a `message` field — a plain-language summary of `status` (`lib/proposedChanges.ts`'s `describeProposalOutcome`) meant for a thin client to display directly: `"Awaiting approval."` / `"Change applied to the calendar."` / `"Change rejected."` / `` `"Failed to apply: {error_message}"` ``.
 
 **Errors:** `401` unauthorized, `400` on a validation failure, `500` on a Supabase or unexpected failure
 
@@ -267,7 +316,7 @@ Applying (whether via auto-apply here or via the `approve` endpoint below) re-ch
 
 **What it does:** applies a `pending` or `failed` proposed change to the calendar (see the application logic described above). Retrying a previously `failed` change is just approving it again.
 
-**Response:** the updated row, `status: "applied"` (with `target_event_id` set to the resulting burner event, for `create`) or `status: "failed"` (with `error_message` set)
+**Response:** the updated row plus `message` (same plain-language summary as `POST /api/proposed-changes`), `status: "applied"` (with `target_event_id` set to the resulting burner event, for `create`) or `status: "failed"` (with `error_message` set)
 
 **Errors:** `401` unauthorized, `404` if no row matches `id`, `409` if the row's `status` isn't `pending` or `failed` (already `applied`/`rejected`), `500` on a Google API or Supabase failure
 
@@ -281,7 +330,7 @@ Applying (whether via auto-apply here or via the `approve` endpoint below) re-ch
 
 **What it does:** marks a `pending` or `failed` proposed change as `rejected` — no calendar write happens. Rejecting a `failed` change is an alternative to retrying it via `approve`.
 
-**Response:** the updated row, `status: "rejected"`
+**Response:** the updated row plus `message`, `status: "rejected"`
 
 **Errors:** `401` unauthorized, `404` if no row matches `id`, `409` if the row's `status` isn't `pending` or `failed`, `500` on a Supabase failure
 

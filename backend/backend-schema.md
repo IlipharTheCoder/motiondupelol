@@ -151,8 +151,9 @@ create table proposed_changes (
   proposed_end timestamptz,
   proposed_summary text,
   proposed_description text,
-  priority text check (priority in ('1','2','3','4','5')),
+  priority text check (priority in ('critical','high','medium','low')),
   color_tag text,
+  deadline timestamptz,
   reason text,
   status text not null default 'pending' check (status in ('pending','applied','rejected','failed')),
   decided_by text check (decided_by in ('user','auto-apply-policy')),
@@ -171,7 +172,13 @@ notify pgrst, 'reload schema';
 
 **Status is a 4-state machine, not 5** — deliberately no separate `approved` state. Applying a change means synchronously calling the Google Calendar API within the same request (either the approve endpoint, or immediately at creation time for a whitelisted auto-apply category), so there's no window where something is "approved but not yet applied" for a state to represent. `pending → applied | rejected | failed`; a `failed` row can be retried (re-approved) or rejected, same as `pending`.
 
-**Which fields are required depends on `change_type`** (enforced by `validateProposedChangeInput` in `lib/proposedChanges.ts`, not by a DB constraint, since the requirement is conditional): `create` needs `proposed_start`/`proposed_end`/`proposed_summary` and no `target_event_id`; `move` needs `target_event_id` + `proposed_start`/`proposed_end`; `update` needs `target_event_id` + at least one proposed field; `delete` needs only `target_event_id`.
+**`priority` is `critical`/`high`/`medium`/`low`, not numeric** — matches how the user actually thinks about events (e.g. doctors' appointments and classes are `critical`), not an arbitrary 1-5 scale. Applies to any timed event ("block"); an all-day event ("note" — birthdays, first-day-of-school-type entries) just doesn't have a meaningful priority, but there's no separate stored "note vs block" type for this — it's inferred from whether the underlying Google event is all-day (`start.date`) vs timed (`start.dateTime`), same distinction `lib/busyIntervals.ts` already makes for scheduling purposes.
+
+**`color_tag` is derived from `category`, never freely chosen** — `lib/eventMetadata.ts`'s `CATEGORY_COLORS` map is the single source of truth (task/habit/focusTime/meeting/fixed/buffer each get a fixed hex color). This is why `color_tag` isn't part of `ProposedChangeInput`: the caller can't set it, so it's never blank. It's computed at proposal-creation time (so a still-`pending` row already shows the right color for a review-queue UI) and re-derived at apply time from whatever category is actually being written (so an `update` that changes an event's category gets the matching color, not a stale one).
+
+**`deadline` is separate from `proposed_start`/`proposed_end`** — the latter is where a block is actually placed on the calendar; `deadline` is a "must be done by" constraint that travels with the event but doesn't by itself schedule anything. No deadline-aware logic reads it yet (no "reject if past deadline," no auto-placement) — that's Phase 3 item 7's "deadline-aware backward planning," a distinct, not-yet-built feature. Today this is pure store-and-round-trip.
+
+**Which fields are required depends on `change_type`** (enforced by `validateProposalInput` in `lib/proposedChanges.ts`, not by a DB constraint, since the requirement is conditional): `create` needs `proposed_start`/`proposed_end`/`proposed_summary` and no `target_event_id`; `move` needs `target_event_id` + `proposed_start`/`proposed_end`; `update` needs `target_event_id` + at least one proposed field; `delete` needs only `target_event_id`.
 
 **Access:** same `GRANT` + `NOTIFY` treatment as above.
 
@@ -181,4 +188,5 @@ notify pgrst, 'reload schema';
 
 ## Tables not yet built (coming per `docs/backend-build-order.md`)
 
+- **Tasks** (Phase 3 item 6/7) — a separate database of tasks distinct from calendar events. A calendar block *can* optionally be tied back to a task row, but doesn't have to be (a meeting or habit block has no task behind it). Not designed yet; when it is, the link is expected to reuse the existing `source_system`/`source_id` fields already on every event/proposal (e.g. a task-backed block would carry `source_system: 'ai-engine'` or similar with `source_id` pointing at the task's row) rather than adding a parallel `task_id` concept. The end goal per the user: the engine takes tasks from this table and gives each one a calendar block via the exact `proposed_changes` `create` flow that already exists.
 - Any local caching of Todoist/Canvas tasks (Phase 3) — not yet designed.

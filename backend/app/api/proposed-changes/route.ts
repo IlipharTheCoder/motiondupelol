@@ -2,6 +2,7 @@ import { isAuthorized } from '@/lib/auth';
 import {
   createProposedChange,
   listProposedChanges,
+  describeProposalOutcome,
   ValidationError,
   type ProposalStatus,
 } from '@/lib/proposedChanges';
@@ -39,7 +40,7 @@ export async function POST(request: Request) {
 
   try {
     const row = await createProposedChange(body);
-    return Response.json(row);
+    return Response.json({ ...row, message: describeProposalOutcome(row) });
   } catch (error) {
     if (error instanceof ValidationError) {
       return Response.json({ error: error.message }, { status: 400 });

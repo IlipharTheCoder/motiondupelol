@@ -1,7 +1,7 @@
 import type { calendar_v3 } from 'googleapis';
 import { calendar } from './googleCalendar';
 import { supabase } from './supabase';
-import { encodeEventMetadata, decodeEventMetadata } from './eventMetadata';
+import { encodeEventMetadata, decodeEventMetadata, CATEGORY_COLORS } from './eventMetadata';
 
 const BURNER_CALENDAR_ID = process.env.GOOGLE_BURNER_CALENDAR_ID!;
 
@@ -373,8 +373,9 @@ async function applyPage(
           sourceId: event.id,
           sourceCalendarId: calendarId,
           sourceLabel: calendarLabel,
-          priority: '3',
-          colorTag: '',
+          priority: 'medium',
+          colorTag: CATEGORY_COLORS.meeting,
+          deadline: '',
         }),
       },
     };

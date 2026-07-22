@@ -1,5 +1,6 @@
 export type BurnerEventType = 'task' | 'habit' | 'focusTime' | 'meeting' | 'fixed' | 'buffer';
 export type SourceSystem = 'todoist' | 'canvas' | 'google' | 'manual' | 'ai-engine';
+export type EventPriority = 'critical' | 'high' | 'medium' | 'low';
 
 export interface EventPrivateProperties {
   schemaVersion: '1';
@@ -9,9 +10,21 @@ export interface EventPrivateProperties {
   sourceId: string;
   sourceCalendarId: string;
   sourceLabel: string;
-  priority: '1' | '2' | '3' | '4' | '5';
+  priority: EventPriority;
   colorTag: string;
+  deadline: string;
 }
+
+// Color is derived from category, not freely chosen, so every event is
+// guaranteed to have one — there's no "forgot to set a color" state.
+export const CATEGORY_COLORS: Record<BurnerEventType, string> = {
+  task: '#4285F4',
+  habit: '#8E24AA',
+  focusTime: '#00897B',
+  meeting: '#F4511E',
+  fixed: '#E53935',
+  buffer: '#9E9E9E',
+};
 
 // extendedProperties values silently truncate above 1024 characters with no
 // error from the Calendar API — every field here is fixed/enum-sized and

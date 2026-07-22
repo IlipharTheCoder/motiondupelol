@@ -3,8 +3,10 @@ import { supabase } from './supabase';
 import {
   encodeEventMetadata,
   decodeEventMetadata,
+  CATEGORY_COLORS,
   type BurnerEventType,
   type SourceSystem,
+  type EventPriority,
 } from './eventMetadata';
 import { detectConflicts } from './freeSlots';
 
@@ -29,13 +31,14 @@ export interface ProposedChangeInput {
   proposed_end?: string;
   proposed_summary?: string;
   proposed_description?: string;
-  priority?: '1' | '2' | '3' | '4' | '5';
-  color_tag?: string;
+  priority?: EventPriority;
+  deadline?: string;
   reason?: string;
 }
 
 export interface ProposedChangeRow extends ProposedChangeInput {
   id: string;
+  color_tag: string;
   status: ProposalStatus;
   decided_by: DecidedBy | null;
   decided_at: string | null;
@@ -47,6 +50,7 @@ export interface ProposedChangeRow extends ProposedChangeInput {
 
 const CHANGE_TYPES: ChangeType[] = ['create', 'move', 'update', 'delete'];
 const BURNER_EVENT_TYPES: BurnerEventType[] = ['task', 'habit', 'focusTime', 'meeting', 'fixed', 'buffer'];
+const EVENT_PRIORITIES: EventPriority[] = ['critical', 'high', 'medium', 'low'];
 
 export function validateProposalInput(input: ProposedChangeInput): void {
   if (!CHANGE_TYPES.includes(input.change_type)) {
@@ -54,6 +58,9 @@ export function validateProposalInput(input: ProposedChangeInput): void {
   }
   if (!BURNER_EVENT_TYPES.includes(input.category)) {
     throw new ValidationError(`"category" must be one of ${BURNER_EVENT_TYPES.join(', ')}`);
+  }
+  if (input.priority && !EVENT_PRIORITIES.includes(input.priority)) {
+    throw new ValidationError(`"priority" must be one of ${EVENT_PRIORITIES.join(', ')}`);
   }
 
   switch (input.change_type) {
@@ -85,10 +92,10 @@ export function validateProposalInput(input: ProposedChangeInput): void {
         !input.proposed_summary &&
         !input.proposed_description &&
         !input.priority &&
-        !input.color_tag
+        !input.deadline
       ) {
         throw new ValidationError(
-          '"update" requires at least one of "proposed_start", "proposed_end", "proposed_summary", "proposed_description", "priority", or "color_tag"'
+          '"update" requires at least one of "proposed_start", "proposed_end", "proposed_summary", "proposed_description", "priority", or "deadline"'
         );
       }
       break;
@@ -180,8 +187,9 @@ export async function applyProposedChange(
               sourceId: row.source_id ?? row.id,
               sourceCalendarId: '',
               sourceLabel: '',
-              priority: row.priority ?? '3',
-              colorTag: row.color_tag ?? '',
+              priority: row.priority ?? 'medium',
+              colorTag: CATEGORY_COLORS[row.category],
+              deadline: row.deadline ?? '',
             }),
           },
         },
@@ -220,8 +228,9 @@ export async function applyProposedChange(
               sourceId: existingMeta.sourceId ?? row.source_id ?? row.id,
               sourceCalendarId: existingMeta.sourceCalendarId ?? '',
               sourceLabel: existingMeta.sourceLabel ?? '',
-              priority: row.priority ?? existingMeta.priority ?? '3',
-              colorTag: row.color_tag ?? existingMeta.colorTag ?? '',
+              priority: row.priority ?? existingMeta.priority ?? 'medium',
+              colorTag: CATEGORY_COLORS[existingMeta.type ?? row.category],
+              deadline: row.deadline ?? existingMeta.deadline ?? '',
             }),
           },
         },
@@ -257,7 +266,7 @@ export async function createProposedChange(input: ProposedChangeInput): Promise<
 
   const { data, error } = await supabase
     .from('proposed_changes')
-    .insert({ ...input, status: 'pending' })
+    .insert({ ...input, color_tag: CATEGORY_COLORS[input.category], status: 'pending' })
     .select('*')
     .single();
   if (error) throw new Error(`proposed_changes insert failed: ${error.message}`);
@@ -288,6 +297,21 @@ export async function rejectProposedChange(id: string): Promise<ProposedChangeRo
     decided_by: 'user',
     decided_at: new Date().toISOString(),
   });
+}
+
+// A plain-language summary of a row's outcome, for a thin client to display
+// directly rather than having to interpret status/error_message itself.
+export function describeProposalOutcome(row: ProposedChangeRow): string {
+  switch (row.status) {
+    case 'pending':
+      return 'Awaiting approval.';
+    case 'applied':
+      return 'Change applied to the calendar.';
+    case 'rejected':
+      return 'Change rejected.';
+    case 'failed':
+      return `Failed to apply: ${row.error_message}`;
+  }
 }
 
 export async function listProposedChanges(status?: ProposalStatus): Promise<ProposedChangeRow[]> {
