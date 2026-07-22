@@ -23,13 +23,13 @@ Each item below references its number from `ai-calendar-manager-spec.md`'s secti
 The immediate next step — everything after this depends on it actually working.
 
 1. ✅ **Done.** **`GET /api/calendar/events`** — list events from the burner calendar using the service account credentials. No scheduling logic yet, just proves the auth chain works end to end (table #19). Implemented via `lib/googleCalendar.ts` (shared JWT client, full `calendar` scope) + `app/api/calendar/events/route.ts`; verified locally against the real burner calendar.
-2. **External → burner sync engine** — using `syncToken` for incremental updates and `extendedProperties` source-ID tagging for dedup, per the design already locked into `architecture-plan.md` section 2a (table #19, #20).
+2. ✅ **Done.** **External → burner sync engine** — using `syncToken` for incremental updates and `extendedProperties` source-ID tagging for dedup, per the design already locked into `architecture-plan.md` section 2a (table #19, #20). Implemented via `lib/calendarSync.ts` + `lib/eventMetadata.ts` + `POST /api/calendar/sync`, backed by two new Supabase tables (`calendar_sync_state`, `synced_events`) for resumable, efficient dedup. Source calendars are configured via `GOOGLE_SOURCE_CALENDAR_IDS` (`calendarList.list()` doesn't work for service accounts — see `architecture-plan.md` section 2a), each tagged with a `sourceLabel`; first backfill per calendar capped 1 year out; Google writes retry with backoff to survive the Calendar API's write burst quota. Verified end-to-end against 5 real calendars — full backfill, idempotent re-run (steady-state incremental, zero changes), and correct `sourceLabel` tagging all confirmed.
 
 ## Phase 2 — The shared primitive + the safety pattern
 
 Build these before any feature that writes to the calendar — everything in Phase 3 is "apply this primitive with different constraints," and nothing should auto-write without the review queue existing first.
 
-3. **Free-slot finding / conflict detection** (table #1, #2) — the one piece of logic that tasks, habits, focus time, buffer insertion, and the booking page will all reuse. Worth over-investing in correctness here specifically.
+3. ✅ **Done.** **Free-slot finding / conflict detection** (table #1, #2) — the one piece of logic that tasks, habits, focus time, buffer insertion, and the booking page will all reuse. Worth over-investing in correctness here specifically. Implemented as a clean pure/IO split: `lib/intervals.ts` (pure interval math — merge/subtract/pad/filter, unit-tested), `lib/workingHours.ts` (DST-correct working-window generation via `luxon`, unit-tested including real spring-forward/fall-back transitions), `lib/busyIntervals.ts` (Google fetch + per-event-timezone normalization, unit-tested), `lib/freeSlots.ts` (`findFreeSlots`/`detectConflicts` orchestration), `lib/schedulingConfig.ts` (`HOME_TIMEZONE`/`WORKING_HOURS_START`/`WORKING_HOURS_END`/`WORKING_DAYS` env vars, defaults `America/New_York` 10:00–18:00 Mon–Fri). Exposed via `GET /api/calendar/free-slots` and `GET /api/calendar/conflicts` for verification against the real burner calendar. 47 unit tests (`npm test`), every non-cancelled burner event counts as busy regardless of `flexible` tag — deciding what to do about conflicts is explicitly deferred to item 5.
 4. **Proposed-changes / review queue** — a data model (separate from calendar events) plus approve/reject endpoints. This is the human-in-the-loop mechanism from the spec's AI Assistant section — every scheduling feature from here on proposes into this queue rather than writing directly.
 5. **Auto-reschedule on conflict** (table #3) — mechanical once #3 and #4 exist: detect overlap, propose a move, wait for approval.
 
@@ -76,4 +76,4 @@ Explicitly parked, not forgotten:
 
 ## What to hand Claude right now
 
-Phase 1, item 2 — the external → burner sync engine. Item 1 (calendar connection test) is done; this is the next thing everything else depends on.
+Phase 2, item 3 (free-slot finding / conflict detection) is done. Next up is item 4 — the proposed-changes/review queue, the human-in-the-loop mechanism every scheduling feature from here on writes through instead of the calendar directly.
