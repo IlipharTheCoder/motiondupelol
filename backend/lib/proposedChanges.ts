@@ -10,6 +10,7 @@ import {
   type EventPriority,
 } from './eventMetadata';
 import { detectConflicts } from './freeSlots';
+import { normalizeTags } from './normalizeTags';
 
 const BURNER_CALENDAR_ID = process.env.GOOGLE_BURNER_CALENDAR_ID!;
 
@@ -33,6 +34,7 @@ export interface ProposedChangeInput {
   proposed_summary?: string;
   proposed_description?: string;
   priority?: EventPriority;
+  tags?: string[];
   deadline?: string;
   reason?: string;
 }
@@ -64,16 +66,29 @@ export function validateProposalInput(input: ProposedChangeInput): void {
   }
 
   switch (input.change_type) {
-    case 'create':
+    case 'create': {
       if (input.target_event_id) {
         throw new ValidationError('"target_event_id" must not be set for a "create" change_type');
       }
-      if (!input.proposed_start || !input.proposed_end || !input.proposed_summary) {
+      if (!input.proposed_summary) {
+        throw new ValidationError('"create" requires "proposed_summary"');
+      }
+      const hasStart = !!input.proposed_start;
+      const hasEnd = !!input.proposed_end;
+      if (hasStart !== hasEnd) {
+        throw new ValidationError('"create" requires both "proposed_start" and "proposed_end", or neither');
+      }
+      // A task-list intake (no start/end yet, just a title + deadline — see
+      // architecture-plan.md section 4a) is the one "create" shape allowed to
+      // omit them, and only for category "task"; every other category always
+      // means "put this on the calendar," which needs a time slot.
+      if (!hasStart && input.category !== 'task') {
         throw new ValidationError(
-          '"create" requires "proposed_start", "proposed_end", and "proposed_summary"'
+          '"proposed_start" and "proposed_end" are required for "create" unless "category" is "task"'
         );
       }
       break;
+    }
     case 'move':
       if (!input.target_event_id) {
         throw new ValidationError('"move" requires "target_event_id"');
@@ -156,7 +171,8 @@ export async function applyProposedChange(
   const now = new Date().toISOString();
 
   try {
-    if (row.change_type === 'create' || row.change_type === 'move') {
+    const isCalendarCreate = row.change_type === 'create' && !!row.proposed_start && !!row.proposed_end;
+    if (isCalendarCreate || row.change_type === 'move') {
       const { hasConflict, conflicts } = await detectConflicts(
         new Date(row.proposed_start!),
         new Date(row.proposed_end!),
@@ -170,7 +186,7 @@ export async function applyProposedChange(
 
     let resultingEventId = row.target_event_id ?? null;
 
-    if (row.change_type === 'create') {
+    if (row.change_type === 'create' && isCalendarCreate) {
       const { data } = await calendar.events.insert({
         calendarId: BURNER_CALENDAR_ID,
         requestBody: {
@@ -195,6 +211,32 @@ export async function applyProposedChange(
         },
       });
       resultingEventId = data.id!;
+    } else if (row.change_type === 'create') {
+      // No proposed_start/proposed_end: a task-list intake (architecture-plan.md
+      // section 4a), not a calendar write — insert into `tasks` instead, and
+      // link back to whichever synced_tasks row (if any) is waiting on this
+      // proposal so the sync knows it's now resolved.
+      const { data: taskRow, error: taskError } = await supabase
+        .from('tasks')
+        .insert({
+          title: row.proposed_summary,
+          description: row.proposed_description ?? null,
+          deadline: row.deadline ?? null,
+          priority: row.priority ?? null,
+          tags: row.tags ?? [],
+          source_system: row.source_system,
+          source_id: row.source_id ?? null,
+          status: 'unscheduled',
+        })
+        .select('*')
+        .single();
+      if (taskError) throw new Error(`tasks insert failed: ${taskError.message}`);
+
+      const { error: syncedTasksError } = await supabase
+        .from('synced_tasks')
+        .update({ task_id: taskRow.id })
+        .eq('proposed_change_id', row.id);
+      if (syncedTasksError) throw new Error(`synced_tasks link failed: ${syncedTasksError.message}`);
     } else if (row.change_type === 'move') {
       await calendar.events.patch({
         calendarId: BURNER_CALENDAR_ID,
@@ -240,6 +282,14 @@ export async function applyProposedChange(
         calendarId: BURNER_CALENDAR_ID,
         eventId: row.target_event_id!,
       });
+      // Best-effort: if this event was backed by a `tasks` row (todoist/canvas
+      // sync completion/deletion flow, architecture-plan.md section 4a step
+      // 7), close it out too. A miss here shouldn't turn an already-succeeded
+      // calendar delete into a "failed" proposal.
+      await supabase
+        .from('tasks')
+        .update({ status: 'completed' })
+        .eq('scheduled_event_id', row.target_event_id!);
     }
 
     return await updateProposedChange(row.id, {
@@ -266,7 +316,12 @@ export async function createProposedChange(input: ProposedChangeInput): Promise<
 
   const { data, error } = await supabase
     .from('proposed_changes')
-    .insert({ ...input, color_tag: CATEGORY_COLORS[input.category], status: 'pending' })
+    .insert({
+      ...input,
+      tags: normalizeTags(input.tags),
+      color_tag: CATEGORY_COLORS[input.category],
+      status: 'pending',
+    })
     .select('*')
     .single();
   if (error) throw new Error(`proposed_changes insert failed: ${error.message}`);
@@ -297,6 +352,37 @@ export async function rejectProposedChange(id: string): Promise<ProposedChangeRo
     decided_by: 'user',
     decided_at: new Date().toISOString(),
   });
+}
+
+// Sets priority/tags on a still-open proposal — the review-time step
+// architecture-plan.md section 4a describes for a Todoist task-intake
+// proposal, whose sync deliberately leaves both unset (neither is something
+// the source system can tell us). Not restricted to that source, though:
+// any pending/failed proposal can be corrected the same way before approving.
+export async function updateProposedChangeFields(
+  id: string,
+  patch: { priority?: EventPriority; tags?: string[] }
+): Promise<ProposedChangeRow> {
+  const row = await getProposedChange(id);
+  if (row.status !== 'pending' && row.status !== 'failed') {
+    throw new ConflictError(`Cannot edit a proposed change with status "${row.status}"`);
+  }
+
+  const update: Partial<ProposedChangeRow> = {};
+  if (patch.priority !== undefined) {
+    if (!EVENT_PRIORITIES.includes(patch.priority)) {
+      throw new ValidationError(`"priority" must be one of ${EVENT_PRIORITIES.join(', ')}`);
+    }
+    update.priority = patch.priority;
+  }
+  if (patch.tags !== undefined) {
+    update.tags = normalizeTags(patch.tags);
+  }
+  if (Object.keys(update).length === 0) {
+    throw new ValidationError('At least one of "priority" or "tags" is required');
+  }
+
+  return updateProposedChange(id, update);
 }
 
 // A plain-language summary of a row's outcome, for a thin client to display

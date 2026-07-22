@@ -159,7 +159,9 @@ This is the recurring cycle that keeps everything in sync. Triggered on a schedu
 
 ## 4. Universal Inbox — v1 (screenshot clipper)
 
-Scoped down to exactly what you described: screenshot in, parsed text out, ready to work with. Everything else (web clipper, Gmail, Todoist, Canvas as capture sources) slots into this same pipeline later — they'd just be additional ways to create a row in the same inbox table, so building v1 correctly means the rest is additive, not a rebuild.
+Scoped down to exactly what you described: screenshot in, parsed text out, ready to work with. Everything else (web clipper, Gmail as capture sources) slots into this same pipeline later — they'd just be additional ways to create a row in the same inbox table, so building v1 correctly means the rest is additive, not a rebuild.
+
+**Correction (section 4a, 2026-07-22):** the line above originally listed Todoist and Canvas as future inbox-table sources too — that's now superseded. Both are already-structured task sources (clear title, real due date), unlike a screenshot that needs Claude to even figure out what it is. They get their own path, described in 4a, rather than going through inbox triage.
 
 **Flow:**
 
@@ -174,6 +176,64 @@ Scoped down to exactly what you described: screenshot in, parsed text out, ready
    - Discard it → row marked `status: "discarded"`, ignored going forward.
 
 **Why a database row and not "a file":** you need to query "give me all untriaged items" every loop cycle, update status as items move through the pipeline, and eventually search/filter by date or type. A flat file makes every one of those harder for no benefit — the database you're already running for the scheduler covers this for free.
+
+---
+
+## 4a. Todoist Task Sync (implemented 2026-07-22)
+
+**Why this doesn't reuse the Universal Inbox pipeline (section 4):** the inbox is for *ambiguous* captures — a screenshot needs Claude just to figure out whether it's a task, a note, or an event. A Todoist task already has a clear title and a real due date; running it through vision-parsing triage would be solving a problem it doesn't have. It gets its own path instead.
+
+**Why this is more hands-on than the calendar sync (section 2a):** the calendar sync is fully passive — external calendars mirror into the burner calendar with zero judgment calls, because "what this event is" is already fully known (it's someone's real meeting). A Todoist task's title and due date are similarly just facts to copy over, but *priority* and *tags* aren't things Todoist can tell us — they reflect how you want to organize your own work, not something the source system defines. So this pipeline deliberately stops and waits for you at that one point, rather than guessing.
+
+**New data model — a `tasks` table, distinct from both calendar events and the Universal Inbox.** This is the "database of tasks" side of the model discussed directly with you: calendar events and tasks are separate things, and a calendar block *can* optionally point back at the task that produced it, but plenty of blocks (meetings, habits) never have one.
+
+```
+tasks
+  id
+  title                -- direct from Todoist's task content
+  description
+  deadline              -- timestamptz, direct from Todoist's due date — not proposed_start/end, this task has no time slot yet
+  priority               -- critical | high | medium | low (lib/eventMetadata.ts's EventPriority — reused, not a new scale). Set by you at review time, never imported from Todoist's own priority levels
+  tags                   -- text[], same normalizeTags() treatment as inbox_items. Set by you at review time
+  source_system          -- 'todoist' | 'canvas' | 'manual'
+  source_id               -- the source system's own task id
+  status                  -- 'unscheduled' | 'scheduled' | 'completed' | 'discarded'
+  scheduled_event_id     -- burner calendar event id, once something (Phase 3 item 7) gives it an actual time slot
+```
+
+**Dedup mapping, mirroring `synced_events`/`calendar_sync_state` from section 2a — same pattern, not reinvented:**
+
+```
+synced_tasks
+  source_system, source_id     -- primary key pair
+  proposed_change_id            -- the create-proposal made for this task, while still unresolved
+  task_id                        -- the resulting tasks row, once approved
+  source_updated_at              -- the source system's own last-modified timestamp, for change detection
+```
+
+**Flow:**
+
+1. Fetch active tasks from Todoist's REST API (`TODOIST_API_TOKEN` — a personal access token, no OAuth flow needed, much simpler than the Google service-account setup). A full list each run, not an incremental sync token — a personal task list is small enough that diffing the full list against `synced_tasks` is simpler and cheap, unlike the calendar sync's larger event volumes where `syncToken` genuinely earned its complexity.
+2. For each Todoist task with no `synced_tasks` row yet, propose it — same "never write directly" principle as everywhere else, just a new source feeding the same review queue built in Phase 2 item 4.
+3. **This introduces a new, valid shape of `create` proposal.** Every `create` proposal today represents "put this on the calendar at this specific time," requiring `proposed_start`/`proposed_end`. A freshly-pulled Todoist task doesn't have a time yet — only a deadline. So: a `create` proposal with `category: 'task'` and **no** `proposed_start`/`proposed_end` means "add this to the task list," not "put this on the calendar." `proposed_summary` = the task's title, `deadline` = its due date, `source_system: 'todoist'`, `source_id` = its Todoist id. `priority` and `tags` are deliberately left unset by the sync itself — this is the "more active" part: you set them when you review the proposal, since nothing upstream can fill them in correctly.
+4. **`proposed_changes` needs a new `tags` column** (`text[]`, same `normalizeTags()` treatment as `inbox_items`) so a value set at review time has somewhere to live and can travel through to the resulting `tasks` row. It doesn't exist on this table today.
+5. **Applying this shape of proposal writes to `tasks`, not the calendar.** `applyProposedChange`'s `create` branch always calls `calendar.events.insert()` today; it needs a second path — when `proposed_start`/`proposed_end` are both absent, insert into `tasks` instead (title/description/deadline/priority/tags from the proposal), leave `target_event_id` null (nothing was written to Google), and record the resulting `tasks.id` back onto `synced_tasks`.
+6. **Giving a task an actual calendar slot is a separate, later step** — Phase 3 item 7 (AI Tasks, not yet built) is what reads `tasks` rows with `status: 'unscheduled'` and proposes a *normal* `create` (this time *with* `proposed_start`/`proposed_end`, `source_system: 'ai-engine'`, `source_id` pointing at the `tasks` row) through the exact same review queue. This is the "engine takes all tasks and gives them a calendar block" end goal already discussed with you — additive on top of what's described here, not a different mechanism.
+7. **Completion/deletion in Todoist:** if the task hasn't been scheduled yet (still `unscheduled` in `tasks`, or its create-proposal is still `pending`), the sync can just withdraw it directly — nothing user-visible has happened yet, so there's nothing to confirm. If it's already become a real calendar event (`scheduled_event_id` set), completing/deleting it in Todoist instead proposes a `delete` through the review queue — removing something you already committed to seeing on your calendar still deserves a tap, same principle as everywhere else in this project.
+
+**Auto-apply still applies unchanged** — `AUTO_APPLY_CATEGORIES` isn't special-cased for this. But since an auto-applied task-intake proposal lands with no `priority`/`tags` set (nothing reviewed it), leave `task` out of that whitelist if you want to guarantee you always get a chance to triage before it's real.
+
+**Deliberately out of scope for this design:** propagating an edit made in Todoist *after* a task has already been imported (e.g. you reword it in Todoist once it's already sitting in `tasks`). `synced_tasks.source_updated_at` captures enough to detect that this happened, but deciding *what to do about it* — silently update, or re-propose for review — isn't resolved here. Flagged rather than guessed at.
+
+**New route:** `POST /api/todoist/sync`, same on-demand-only shape as `POST /api/calendar/sync` — nothing in this backend runs on a schedule yet.
+
+**Implementation notes (2026-07-22):**
+- `proposed_changes` gained the `tags` column this design called for, plus a relaxed `create` validation rule: `proposed_start`/`proposed_end` may both be omitted, but only when `category` is `'task'` — that's the task-list-intake shape. `applyProposedChange` branches on their presence to decide "write to `tasks`" vs. "write to the calendar."
+- **The "set priority/tags at review time" step needed a new endpoint that didn't exist yet:** nothing previously let you edit a still-`pending` proposal's fields before approving it. Added `PATCH /api/proposed-changes/{id}` (`lib/proposedChanges.ts`'s `updateProposedChangeFields`) — accepts `priority` and/or `tags`, only on a `pending`/`failed` row. This is the mechanism for the "you set them when you review the proposal" line above.
+- **Added `GET /api/tasks`** (optional `status` filter) — not called for explicitly above, but without it there was no way to see what actually landed in the `tasks` table after approving an intake proposal. Mirrors `GET /api/inbox`/`GET /api/proposed-changes`'s shape.
+- **Withdrawing an unscheduled task** (step 7's "the sync can just withdraw it directly") is implemented as: mark the still-`pending`/`failed` intake proposal `rejected` (decided_by `'auto-apply-policy'`, since there's no separate "withdrawn" status in the 4-state machine) and delete its `synced_tasks` row. If it was already rejected by you, it's left alone rather than re-proposed on the next sync.
+- **`synced_tasks.source_updated_at`** is populated from Todoist's `created_at` field as a placeholder — the REST API v2 exposes no true last-modified timestamp, and this field isn't acted on yet anyway (see the "deliberately out of scope" note above).
+- **Closing the loop on task-backed calendar deletes:** when an approved/auto-applied `delete` proposal's `target_event_id` matches a `tasks.scheduled_event_id`, `applyProposedChange` marks that `tasks` row `completed` as a side effect (best-effort — a failure here doesn't turn an already-succeeded calendar delete into a `failed` proposal). Not explicitly speced above, but without it a task-backed event's deletion would leave `tasks.status` permanently stuck at `'scheduled'`.
 
 ---
 
@@ -199,6 +259,7 @@ This is the payoff of the "everything writes to one calendar, one engine reads i
 | Calendar events (tasks, habits, meetings, focus time) | Burner Google Calendar, `extendedProperties` for metadata | Single system of record; native to the platform you're already syncing with |
 | Universal Inbox items (screenshots + parsed text) | Supabase Postgres (metadata) + Supabase Storage (images) | Needs to be queryable and cross-device; free tier covers both data types in one service |
 | Growable event data (subtasks, notes) | Supabase Postgres, `event_metadata` table keyed by Google event ID | `extendedProperties` truncates at 1024 characters — anything that can grow past that doesn't belong on the calendar event itself |
+| Tasks (Todoist/Canvas — already-structured work items) | Supabase Postgres, `tasks` + `synced_tasks` tables (section 4a) | Distinct from the Universal Inbox, which is for *ambiguous* captures needing parsing — a Todoist task already has a clear title and due date, so it skips inbox triage entirely |
 | Scheduling engine logic | Vercel serverless functions | Needs to run even when devices are offline/asleep; triggered by cron + on-demand |
 | Booking pages | Vercel (public routes) | Needs to be reachable by people without your app |
 | Google service account credentials | Vercel environment variables (encrypted) — `GOOGLE_SERVICE_ACCOUNT_EMAIL`, `GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY`, `GOOGLE_BURNER_CALENDAR_ID`, `GOOGLE_SOURCE_CALENDAR_IDS` | Backend-only; app calendars are shared with the service account, so no per-user OAuth flow is needed (see section 2a) |

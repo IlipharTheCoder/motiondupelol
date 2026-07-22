@@ -315,15 +315,18 @@ Bounded to ~50s of work per call (Vercel `maxDuration: 60`). If a backfill is la
   "proposed_summary": "string (required for create)",
   "proposed_description": "string (optional)",
   "priority": "critical | high | medium | low (optional, default medium)",
+  "tags": "string[] (optional) — normalized (trimmed/lowercased) same as inbox_items; only meaningful for category: 'task'",
   "deadline": "ISO datetime (optional) — a \"must be done by\" constraint, independent of proposed_start/proposed_end",
   "reason": "string (optional, human-readable justification)"
 }
 ```
 `update` requires `target_event_id` plus at least one of `proposed_start`/`proposed_end`/`proposed_summary`/`proposed_description`/`priority`/`deadline`.
 
+**`create` may omit `proposed_start`/`proposed_end` entirely — but only when `category` is `'task'`.** That shape means "add this to the task list" rather than "put this on the calendar" (`architecture-plan.md` section 4a) — `proposed_summary` becomes the task's title, `deadline` its due date, and applying it inserts into the `tasks` table (`backend-schema.md`) instead of calling the Calendar API; `target_event_id` stays `null`. `proposed_start` and `proposed_end` must both be present or both be absent — one without the other is a `400`. Every category other than `'task'` still requires both.
+
 Note there's no `color_tag` input — color is always derived from `category` (`lib/eventMetadata.ts`'s `CATEGORY_COLORS`), never freely chosen, so it's never blank. The response's `color_tag` reflects this even on a still-`pending` row (useful for a review-queue UI to show the right color before approval).
 
-**What it does:** validates the input for its `change_type` (`lib/proposedChanges.ts`'s `validateProposalInput`), inserts a `pending` row, then checks `category` against the `AUTO_APPLY_CATEGORIES` env var (comma-separated `BurnerEventType` list, e.g. `habit,buffer`; empty/unset means nothing auto-applies). If `category` is whitelisted, the change is applied to the calendar immediately in the same request — the response reflects the final `applied`/`failed` state, not `pending`.
+**What it does:** validates the input for its `change_type` (`lib/proposedChanges.ts`'s `validateProposalInput`), inserts a `pending` row, then checks `category` against the `AUTO_APPLY_CATEGORIES` env var (comma-separated `BurnerEventType` list, e.g. `habit,buffer`; empty/unset means nothing auto-applies). If `category` is whitelisted, the change is applied to the calendar immediately in the same request — the response reflects the final `applied`/`failed` state, not `pending`. If you want a chance to set `priority`/`tags` before a Todoist task-intake proposal becomes real, keep `task` out of `AUTO_APPLY_CATEGORIES`.
 
 Applying (whether via auto-apply here or via the `approve` endpoint below) re-checks for conflicts on `create`/`move` using `detectConflicts` (`GET /api/calendar/conflicts`'s underlying function) — a conflict fails the change (`status: "failed"`, descriptive `error_message`) rather than double-booking. `create` builds `extendedProperties.private` via `encodeEventMetadata`; `update` reads the existing event first and merges changed fields into its metadata (Google's `patch` replaces the whole `extendedProperties.private` map rather than merging individual keys, so the full map is always resent) — `color_tag` is re-derived from whichever category ends up written, not preserved from the stale row.
 
@@ -361,6 +364,66 @@ Applying (whether via auto-apply here or via the `approve` endpoint below) re-ch
 
 ---
 
+## `PATCH /api/proposed-changes/{id}`
+
+**Auth:** required — same as above
+
+**Request:** `application/json`, at least one of:
+```json
+{
+  "priority": "critical | high | medium | low",
+  "tags": "string[]"
+}
+```
+
+**What it does:** edits a still-open (`pending` or `failed`) proposed change's `priority`/`tags` before it's approved. This is the review-time step Todoist task-intake proposals need — the sync deliberately leaves both unset (Todoist can't tell us how you want to prioritize/organize your own work), so you set them here before approving. Not specific to Todoist — any pending/failed proposal can be corrected the same way. `tags` is normalized the same way as `inbox_items`.
+
+**Response:** the updated row plus `message` (same plain-language summary as the other proposed-changes routes)
+
+**Errors:** `401` unauthorized, `400` if neither field is given or `priority` is invalid, `404` if no row matches `id`, `409` if the row's `status` isn't `pending` or `failed`, `500` on a Supabase failure
+
+---
+
+## `POST /api/todoist/sync`
+
+**Auth:** required — same as above
+
+**Request:** no body
+
+**What it does:** on-demand Todoist task sync (`architecture-plan.md` section 4a) — fetches your active Todoist tasks (`TODOIST_API_TOKEN`, a personal access token) and diffs the full list against `synced_tasks`. Every Todoist task with no `synced_tasks` row yet gets a `create` proposal into `proposed_changes` (`category: 'task'`, no `proposed_start`/`proposed_end`, `proposed_summary` = the task's title, `deadline` = its due date, `source_system: 'todoist'`) — this is the "add to the task list" shape described above, so nothing lands in `tasks` until you approve it (and, typically, set `priority`/`tags` first via `PATCH /api/proposed-changes/{id}`). Tasks that drop out of Todoist's active list (completed or deleted there — the REST API doesn't distinguish, and both get the same handling) either get silently withdrawn (if nothing user-visible happened yet: the intake proposal is still pending/failed, or already rejected) or get a `delete` proposal into the review queue (if already scheduled onto the calendar).
+
+Same on-demand-only shape as `POST /api/calendar/sync` — nothing in this backend runs on a schedule yet.
+
+**Response:**
+```json
+{
+  "proposed": "number — new task-intake proposals created this run",
+  "skippedExisting": "number — Todoist tasks already tracked in synced_tasks",
+  "withdrawnUnscheduled": "number — tasks that disappeared from Todoist before ever reaching the calendar",
+  "proposedDeletes": "number — delete proposals created for tasks that disappeared after already being scheduled",
+  "errors": "string[] — per-task failures; a failure on one task doesn't stop the rest"
+}
+```
+
+**Errors:** `401` unauthorized, `500` if `TODOIST_API_TOKEN` is unset, the Todoist API call fails, or on an unexpected/Supabase failure
+
+---
+
+## `GET /api/tasks`
+
+**Auth:** required — same as above
+
+**Query params:** `status` (optional — one of `unscheduled`/`scheduled`/`completed`/`discarded`; omit to return all rows)
+
+**What it does:** lists rows from `tasks` (`backend-schema.md`), newest first — the task list produced by approving Todoist (or future Canvas/manual) intake proposals.
+
+**Response:** array of `tasks` rows
+
+**Errors:** `401` unauthorized, `400` if `status` isn't a valid value, `500` on a Supabase failure
+
+---
+
 ## Not yet built
 
-- Task/habit/focus-time endpoints — Phase 3
+- AI Tasks — auto-placement of `tasks` rows into free calendar slots, deadline-aware planning (Phase 3 item 7)
+- Habit/focus-time endpoints — Phase 3

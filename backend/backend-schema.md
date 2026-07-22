@@ -153,6 +153,7 @@ create table proposed_changes (
   proposed_summary text,
   proposed_description text,
   priority text check (priority in ('critical','high','medium','low')),
+  tags text[],
   color_tag text,
   deadline timestamptz,
   reason text,
@@ -168,6 +169,12 @@ create table proposed_changes (
 grant select, insert, update, delete on proposed_changes to service_role;
 notify pgrst, 'reload schema';
 ```
+
+**`tags` (added 2026-07-22, Todoist task sync, section 4a):** `text[]`, same `normalizeTags()` treatment as `inbox_items`. Not settable on creation by a sync — a Todoist task-intake `create` proposal lands with `tags: []`, and you set real tags via `PATCH /api/proposed-changes/{id}` before approving (same review-time step as `priority`; see `PATCH /api/proposed-changes/{id}` in `backend-api-reference.md`). Only meaningful for `category: 'task'` proposals that end up in the `tasks` table below — untouched for anything that writes to the calendar instead.
+
+**A `create` proposal can now omit `proposed_start`/`proposed_end` — but only when `category` is `'task'`.** This is the "add to the task list, not the calendar" shape (section 4a): `proposed_summary` = the task's title, `deadline` = its due date, nothing scheduled yet. Applying this shape inserts into `tasks` (below) instead of calling the Calendar API — `target_event_id` stays `null` since nothing was written to Google. Every other category still requires both.
+
+If an approved/auto-applied `delete` proposal's `target_event_id` matches a `tasks` row's `scheduled_event_id`, that `tasks` row is marked `completed` as a side effect — closes the loop for the Todoist completion/deletion flow (section 4a step 7) without needing a separate mechanism.
 
 `category` reuses `BurnerEventType` and `source_system` reuses `SourceSystem` (both from `lib/eventMetadata.ts`) rather than inventing parallel enums.
 
@@ -187,7 +194,81 @@ notify pgrst, 'reload schema';
 
 ---
 
-## Tables not yet built (coming per `docs/backend-build-order.md`)
+## `tasks`
 
-- **Tasks** (Phase 3 item 6/7) — a separate database of tasks distinct from calendar events. A calendar block *can* optionally be tied back to a task row, but doesn't have to be (a meeting or habit block has no task behind it). Not designed yet; when it is, the link is expected to reuse the existing `source_system`/`source_id` fields already on every event/proposal (e.g. a task-backed block would carry `source_system: 'ai-engine'` or similar with `source_id` pointing at the task's row) rather than adding a parallel `task_id` concept. The end goal per the user: the engine takes tasks from this table and gives each one a calendar block via the exact `proposed_changes` `create` flow that already exists.
-- Any local caching of Todoist/Canvas tasks (Phase 3) — not yet designed.
+Phase 3 item 6 (Todoist task sync, `architecture-plan.md` section 4a) — a database of tasks, distinct from both calendar events and the Universal Inbox. A calendar block *can* optionally point back at the task that produced it (via `scheduled_event_id`), but plenty of blocks (meetings, habits) never have one. Populated by `POST /api/todoist/sync` approvals (via `applyProposedChange`'s task-list-intake branch, `lib/proposedChanges.ts`) — nothing writes here directly.
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | `uuid` | Primary key, default-generated |
+| `title` | `text` | Direct from the source task's title (Todoist's `content`) |
+| `description` | `text` | |
+| `deadline` | `timestamptz` | A "must be done by" constraint — independent of `scheduled_event_id`'s actual time slot. No deadline-aware logic reads it yet (Phase 3 item 7, not built) |
+| `priority` | `text` | `critical`/`high`/`medium`/`low`, same `EventPriority` scale as everywhere else. `null` until set — never imported from Todoist's own priority levels, set by you at review time via `PATCH /api/proposed-changes/{id}` before approving |
+| `tags` | `text[]` | Same `normalizeTags()` treatment as `inbox_items`. Set by you at review time, same as `priority` |
+| `source_system` | `text` | `'todoist'` / `'canvas'` / `'manual'` |
+| `source_id` | `text` | The source system's own task id (e.g. Todoist's task id) |
+| `status` | `text` | `'unscheduled'` / `'scheduled'` / `'completed'` / `'discarded'` |
+| `scheduled_event_id` | `text` | Burner calendar event id, once Phase 3 item 7 (AI Tasks, not yet built) gives it an actual time slot. `null` until then |
+| `created_at` | `timestamptz` | Default `now()` |
+| `updated_at` | `timestamptz` | Default `now()` |
+
+**Setup SQL:**
+```sql
+create table tasks (
+  id                 uuid primary key default gen_random_uuid(),
+  title              text not null,
+  description        text,
+  deadline           timestamptz,
+  priority           text check (priority in ('critical','high','medium','low')),
+  tags               text[],
+  source_system      text not null check (source_system in ('todoist','canvas','manual')),
+  source_id          text,
+  status             text not null default 'unscheduled' check (status in ('unscheduled','scheduled','completed','discarded')),
+  scheduled_event_id text,
+  created_at         timestamptz not null default now(),
+  updated_at         timestamptz not null default now()
+);
+
+grant select, insert, update, delete on tasks to service_role;
+notify pgrst, 'reload schema';
+```
+
+**Access / No RLS:** same reasoning as `inbox_items`/`event_metadata` — only the backend's `service_role` key ever touches this table.
+
+---
+
+## `synced_tasks`
+
+Dedup mapping for the Todoist sync, mirroring `synced_events`/`calendar_sync_state` (section 2a) — same pattern, not reinvented. Keyed by `{source_system, source_id}` rather than a Supabase-generated id, same reasoning as `event_metadata`.
+
+| Column | Type | Notes |
+|---|---|---|
+| `source_system` | `text` | Part of composite PK |
+| `source_id` | `text` | Part of composite PK — the source system's own task id |
+| `proposed_change_id` | `uuid` | The `create` proposal made for this task while it's still unresolved (`references proposed_changes(id)`). Set at intake, read by `applyProposedChange` to link the resulting `tasks` row back once approved |
+| `task_id` | `uuid` | The resulting `tasks` row, once approved (`references tasks(id)`). `null` while the intake proposal is still pending/failed |
+| `source_updated_at` | `timestamptz` | The source system's own last-modified signal, informational only — **not currently acted on**: propagating a post-import edit made in the source system (e.g. reworded in Todoist after the `tasks` row already exists) is explicitly out of scope for now (`architecture-plan.md` section 4a). For Todoist specifically, the REST API v2 exposes no true "last modified" timestamp, so this is populated from the task's `created_at` as a best-effort placeholder |
+| `created_at` | `timestamptz` | Default `now()` |
+| `updated_at` | `timestamptz` | Default `now()` |
+
+A row here is removed once resolved either way: `task_id` gets linked at approval time, but the row itself is deleted once the sync observes the source task is gone (completed/deleted upstream) — see `lib/todoistSync.ts`. So a row's mere existence means "known to Todoist, tracked here"; there's no `status` column since `proposed_changes.status` / `tasks.status` already carry that.
+
+**Setup SQL:**
+```sql
+create table synced_tasks (
+  source_system      text not null,
+  source_id          text not null,
+  proposed_change_id uuid references proposed_changes(id),
+  task_id            uuid references tasks(id),
+  source_updated_at  timestamptz,
+  created_at         timestamptz not null default now(),
+  updated_at         timestamptz not null default now(),
+  primary key (source_system, source_id)
+);
+
+grant select, insert, update, delete on synced_tasks to service_role;
+notify pgrst, 'reload schema';
+```
+
+**Access / No RLS:** same reasoning as `inbox_items`/`event_metadata`.
