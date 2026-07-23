@@ -283,6 +283,59 @@ Bounded to ~50s of work per call (Vercel `maxDuration: 60`). If a backfill is la
 
 ---
 
+## `POST /api/focus-time/plan`
+
+**Auth:** required — same as above
+
+**Request:** no body
+
+**What it does:** the AI Focus Time weekly-goal auto-fill (`architecture-plan.md` section 4b, `lib/focusTime.ts`). Compares this week's (Monday–Sunday, `HOME_TIMEZONE`) existing `focusTime` calendar time plus this engine's own still-pending/failed `create` proposals against `FOCUS_TIME_WEEKLY_GOAL_MINUTES`; if short, proposes new `focusTime` blocks (`category: 'focusTime'`, `source_system: 'ai-engine'`, `priority: 'high'`, `flexible: 'true'`) into `findFreeSlots` openings for the rest of the week, sized to `FOCUS_TIME_BLOCK_MINUTES` (default 90) or whatever's left of the goal, skipping anything under a 30-minute floor. Same review-queue principle as everywhere else — nothing is written to the calendar directly.
+
+**Response:**
+```json
+{
+  "weekStart": "ISO datetime",
+  "weekEnd": "ISO datetime",
+  "goalMinutes": 0,
+  "alreadyAccountedMinutes": 0,
+  "remainingMinutes": 0,
+  "proposalsCreated": 0,
+  "proposals": [],
+  "noRoomLeftInWeek": false
+}
+```
+`proposals` is the array of newly-created `proposed_changes` rows. `noRoomLeftInWeek: true` means the goal isn't met but there's no more qualifying free time left this week (rather than an error).
+
+**Errors:** `401` unauthorized, `500` if `FOCUS_TIME_WEEKLY_GOAL_MINUTES`/`FOCUS_TIME_BLOCK_MINUTES` are unset or invalid, or on a Google API/Supabase failure. On-demand only — nothing in this backend runs on a schedule yet.
+
+---
+
+## `GET /api/focus-time/stats`
+
+**Auth:** required — same as above
+
+**Query params:** none
+
+**What it does:** computes the Deep Work Index for the current week (`architecture-plan.md` section 4b) — read-only, no proposals or writes.
+
+**Response:**
+```json
+{
+  "weekStart": "ISO datetime",
+  "weekEnd": "ISO datetime",
+  "goalMinutes": 0,
+  "completedMinutes": 0,
+  "scheduledMinutes": 0,
+  "pendingProposalMinutes": 0,
+  "deepWorkIndex": 0
+}
+```
+`completedMinutes` only counts `focusTime` blocks that have already ended — actual deep work done this week, not merely booked. `scheduledMinutes` (booked, still upcoming) and `pendingProposalMinutes` (proposed, not yet approved) are broken out separately. `deepWorkIndex` is `completedMinutes / goalMinutes` as a percentage, uncapped (overshooting a goal shows as >100, not clamped).
+
+**Errors:** `401` unauthorized, `500` if `FOCUS_TIME_WEEKLY_GOAL_MINUTES` is unset/invalid, or on a Google API/Supabase failure.
+
+---
+
 ## `GET /api/proposed-changes`
 
 **Auth:** required — same as above
@@ -426,4 +479,5 @@ Same on-demand-only shape as `POST /api/calendar/sync` — nothing in this backe
 ## Not yet built
 
 - AI Tasks — auto-placement of `tasks` rows into free calendar slots, deadline-aware planning (Phase 3 item 7)
-- Habit/focus-time endpoints — Phase 3
+- Buffer Time endpoints (Phase 3 item 10)
+- AI Habits endpoints (Phase 3 item 8)

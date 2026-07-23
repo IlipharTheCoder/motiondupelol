@@ -237,6 +237,22 @@ synced_tasks
 
 ---
 
+## 4b. AI Focus Time (implemented 2026-07-23)
+
+Phase 3 item 9 (`backend-build-order.md`) — weekly deep-work goal tracking, auto-defend for existing blocks, and a computed Deep Work Index stat. Chosen over two smaller alternatives (template-window placement; a defend-and-report-only slice with no auto-creation) in favor of the fullest version: a weekly minutes goal that the engine actively fills.
+
+**Weekly-goal auto-fill:** `FOCUS_TIME_WEEKLY_GOAL_MINUTES` (required — a personal target, deliberately no default) is compared each run against this week's `focusTime` time already on the burner calendar plus this engine's own still-`pending`/`failed` `create` proposals for the week (so a re-run before you've approved the last batch doesn't double-propose the same slice of week). If short, new blocks are proposed into `findFreeSlots` openings for the rest of the week — sized to `FOCUS_TIME_BLOCK_MINUTES` (default 90) or whatever's left of the goal, whichever is smaller, and skipped below a 30-minute floor so it never proposes a sliver. Same "never write directly" principle as everywhere else: these are `proposed_changes` `create` rows (`category: 'focusTime'`, `source_system: 'ai-engine'`), reviewed like anything else.
+
+**"Week" is Monday 00:00–Sunday 24:00 in `HOME_TIMEZONE`** (Luxon's `startOf('week')`), independent of `WORKING_DAYS` — the goal covers your whole week, even though new blocks still only ever land inside working hours (same as every other proposal `findFreeSlots` produces).
+
+**Auto-defend is priority, not a new mechanism:** every auto-filled block gets `priority: 'high'` (not the default `medium`) and stays `flexible: 'true'`. This reuses item 5's existing auto-reschedule conflict resolution unchanged — a `high`-priority flexible focus block outranks `medium`-priority flexible events, so *they* get moved on conflict instead of the focus block, without a special case anywhere. It can still lose to a `critical` fixed event, which is the right behavior — an unmovable appointment shouldn't get blocked by a focus session.
+
+**Deep Work Index** (`GET /api/focus-time/stats`) is `completedMinutes / goalMinutes` as a percentage — `completedMinutes` only counts this week's `focusTime` blocks that have already ended (a stat about deep work actually done, not merely booked). `scheduledMinutes` (booked but still in the future) and `pendingProposalMinutes` (proposed, not yet approved) are reported alongside it for the fuller picture, uncapped so overshooting a goal is visible rather than clamped at 100.
+
+**New routes:** `POST /api/focus-time/plan` (the auto-fill run, on-demand only — nothing in this backend runs on a schedule yet), `GET /api/focus-time/stats` (read-only). Implemented via `lib/focusTime.ts`; no schema changes needed — `proposed_changes` already supported `category: 'focusTime'` and `source_system: 'ai-engine'`.
+
+---
+
 ## 5. Calendly-style Scheduler (Vercel, free hosting)
 
 This is the piece your notes correctly identified needs its own public web presence — a stranger booking time with you can't go through your native app.
