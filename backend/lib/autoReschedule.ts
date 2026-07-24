@@ -5,23 +5,28 @@ import { getSchedulingConfig, type SchedulingConfig } from './schedulingConfig';
 import { intervalsOverlap, type Interval } from './intervals';
 import { normalizeEventToInterval } from './busyIntervals';
 import { findFreeSlots } from './freeSlots';
-import { decodeEventMetadata, type BurnerEventType, type EventPriority } from './eventMetadata';
+import {
+  decodeEventMetadata,
+  decodeEventTags,
+  PRIORITY_RANK,
+  type BurnerEventType,
+  type EventPriority,
+} from './eventMetadata';
 import { createProposedChange, type ProposedChangeRow } from './proposedChanges';
 
 const BURNER_CALENDAR_ID = process.env.GOOGLE_BURNER_CALENDAR_ID!;
 const PAGE_SIZE = 2500;
 const MAX_PAGES = 20;
 
-// Lower number = more important = less likely to move.
-const PRIORITY_RANK: Record<EventPriority, number> = { critical: 0, high: 1, medium: 2, low: 3 };
-
-interface SchedulableEvent {
+export interface SchedulableEvent {
   eventId: string;
   summary: string | null;
   interval: Interval;
+  isAllDay: boolean;
   flexible: boolean;
   priority: EventPriority;
   category: BurnerEventType;
+  tags: string[];
 }
 
 export interface RescheduleSummary {
@@ -34,7 +39,11 @@ export interface RescheduleSummary {
   proposals: ProposedChangeRow[];
 }
 
-async function fetchSchedulableEvents(
+// Exported for reuse by lib/dayRebalance.ts (POST /api/calendar/rebalance,
+// item 23) — same "fetch every schedulable burner event with its
+// flexible/priority metadata" need, just a different trigger than actual
+// overlap.
+export async function fetchSchedulableEvents(
   rangeStart: Date,
   rangeEnd: Date,
   config: SchedulingConfig
@@ -63,12 +72,14 @@ async function fetchSchedulableEvents(
         eventId: interval.eventId,
         summary: interval.summary,
         interval: { start: interval.start, end: interval.end },
+        isAllDay: interval.isAllDay,
         // Missing metadata (an event never touched by our system) defaults
         // to non-flexible — safest assumption for something we don't
         // recognize is "don't try to move it."
         flexible: meta.flexible === 'true',
         priority: meta.priority ?? 'medium',
         category: meta.type ?? 'meeting',
+        tags: decodeEventTags(meta.tags),
       });
     }
 

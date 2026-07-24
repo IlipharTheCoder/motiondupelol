@@ -1,6 +1,6 @@
 import { calendar } from '@/lib/googleCalendar';
 import { isAuthorized } from '@/lib/auth';
-import { decodeEventMetadata } from '@/lib/eventMetadata';
+import { decodeEventMetadata, decodeEventTags } from '@/lib/eventMetadata';
 
 const DEFAULT_MAX_RESULTS = 50;
 const MAX_MAX_RESULTS = 2500; // Google's own ceiling
@@ -81,6 +81,7 @@ export async function GET(request: Request) {
         priority: meta.priority ?? null,
         deadline: meta.deadline ? meta.deadline : null,
         colorTag: meta.colorTag ? meta.colorTag : null,
+        tags: decodeEventTags(meta.tags),
         origin: {
           sourceSystem: meta.sourceSystem ?? null,
           sourceLabel: meta.sourceLabel ? meta.sourceLabel : null,

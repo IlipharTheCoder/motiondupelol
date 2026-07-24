@@ -8,11 +8,17 @@ interface TodoistDue {
   datetime?: string;
 }
 
+interface TodoistDuration {
+  amount: number;
+  unit: 'minute' | 'day';
+}
+
 interface TodoistTask {
   id: string;
   content: string;
   description: string;
   due: TodoistDue | null;
+  duration: TodoistDuration | null;
   created_at: string;
 }
 
@@ -40,6 +46,15 @@ function todoistDeadline(due: TodoistDue | null): string | undefined {
   if (!due) return undefined;
   if (due.datetime) return due.datetime;
   return `${due.date}T23:59:59Z`;
+}
+
+// Todoist's own duration is optional and most tasks won't have one — this is
+// a best-effort carry-over, not something every task is expected to have.
+// 'day'-unit durations are rare and only approximate once converted to
+// minutes, but still more useful than discarding the signal entirely.
+function todoistDurationMinutes(duration: TodoistDuration | null): number | undefined {
+  if (!duration) return undefined;
+  return duration.unit === 'day' ? duration.amount * 24 * 60 : duration.amount;
 }
 
 async function fetchActiveTasks(): Promise<TodoistTask[]> {
@@ -100,6 +115,7 @@ export async function runTodoistSync(): Promise<TodoistSyncResult> {
         proposed_summary: task.content,
         proposed_description: task.description || undefined,
         deadline: todoistDeadline(task.due),
+        duration_minutes: todoistDurationMinutes(task.duration),
       });
 
       const { error: upsertError } = await supabase.from('synced_tasks').upsert(

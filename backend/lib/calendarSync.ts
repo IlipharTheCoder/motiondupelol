@@ -379,6 +379,7 @@ async function applyPage(
           priority: 'critical',
           colorTag: CATEGORY_COLORS.meeting,
           deadline: '',
+          tags: '',
         }),
       },
     };

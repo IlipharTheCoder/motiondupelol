@@ -31,16 +31,19 @@ export function normalizeEventToInterval(
   if (!start || !end) return null;
 
   if (start.date && end.date) {
-    // All-day event — blocks the full home-timezone day(s). Google's
-    // all-day `end.date` is already exclusive (the day after the last
-    // day), so no +1 adjustment is needed here.
-    return {
-      eventId: event.id,
-      summary: event.summary ?? null,
-      isAllDay: true,
-      start: DateTime.fromISO(start.date, { zone: homeTimezone }).startOf('day').toMillis(),
-      end: DateTime.fromISO(end.date, { zone: homeTimezone }).startOf('day').toMillis(),
-    };
+    // All-day events are treated as notes/markers, not real scheduled time
+    // — almost every all-day entry in practice is informational ("first day
+    // of classes," "orientation week"), not a commitment that should ever
+    // block a free-slot search or register as a conflict. Excluded here at
+    // the shared source (not per-caller) so every consumer gets this for
+    // free: findFreeSlots/detectConflicts (via fetchBusyIntervals),
+    // autoReschedule's conflict scan, and habitPlacement/focusTime/
+    // bufferTime's own event scans. Previously this returned a full-day
+    // interval, which meant a single all-day event could block every timed
+    // slot for its entire date range — caught live while verifying item 24
+    // (a real "Second year student orientation" all-day event blocked an
+    // entire week of conflict-checking).
+    return null;
   }
 
   if (start.dateTime && end.dateTime) {

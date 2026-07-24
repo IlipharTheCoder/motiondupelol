@@ -22,6 +22,7 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ id
     const row = await updateProposedChangeFields(id, {
       priority: body.priority,
       tags: body.tags,
+      duration_minutes: body.duration_minutes,
     });
     return Response.json({ ...row, message: describeProposalOutcome(row) });
   } catch (error) {

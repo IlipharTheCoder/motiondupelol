@@ -1,4 +1,3 @@
-import { DateTime } from 'luxon';
 import type { calendar_v3 } from 'googleapis';
 import { calendar } from './googleCalendar';
 import { supabase } from './supabase';
@@ -7,7 +6,13 @@ import { mergeIntervals, subtractIntervals, type Interval } from './intervals';
 import { normalizeEventToInterval } from './busyIntervals';
 import { decodeEventMetadata } from './eventMetadata';
 import { findFreeSlots } from './freeSlots';
-import { createProposedChange, type ProposedChangeRow } from './proposedChanges';
+import { createProposedChange, ValidationError, type ProposedChangeRow } from './proposedChanges';
+import { getCurrentWeekRange } from './periodRanges';
+
+// Re-exported for anything still importing it from here — the canonical
+// definition now lives in lib/periodRanges.ts (lib/habits.ts needs both a
+// weekly and monthly variant, so it moved out once a second consumer needed it).
+export { getCurrentWeekRange };
 
 const BURNER_CALENDAR_ID = process.env.GOOGLE_BURNER_CALENDAR_ID!;
 const PAGE_SIZE = 2500;
@@ -17,6 +22,19 @@ const MAX_PAGES = 20;
 // slivers even if the weekly goal still has room left.
 const MIN_BLOCK_MINUTES = 30;
 const DEFAULT_BLOCK_MINUTES = 90;
+const DEFAULT_MAX_SUGGEST_OPTIONS = 3;
+const MAX_SUGGEST_OPTIONS_CAP = 10;
+
+// Shared by the weekly auto-fill and the on-demand suggest endpoint — neither
+// requires FOCUS_TIME_WEEKLY_GOAL_MINUTES to resolve a block size.
+function getBlockMinutes(): number {
+  const rawBlock = process.env.FOCUS_TIME_BLOCK_MINUTES?.trim();
+  const blockMinutes = rawBlock ? Number(rawBlock) : DEFAULT_BLOCK_MINUTES;
+  if (!Number.isFinite(blockMinutes) || blockMinutes < MIN_BLOCK_MINUTES) {
+    throw new Error(`FOCUS_TIME_BLOCK_MINUTES must be at least ${MIN_BLOCK_MINUTES} (got "${rawBlock}")`);
+  }
+  return blockMinutes;
+}
 
 function getFocusTimeConfig(): { weeklyGoalMinutes: number; blockMinutes: number } {
   const rawGoal = process.env.FOCUS_TIME_WEEKLY_GOAL_MINUTES?.trim();
@@ -30,26 +48,7 @@ function getFocusTimeConfig(): { weeklyGoalMinutes: number; blockMinutes: number
     throw new Error(`FOCUS_TIME_WEEKLY_GOAL_MINUTES="${rawGoal}" must be a positive number`);
   }
 
-  const rawBlock = process.env.FOCUS_TIME_BLOCK_MINUTES?.trim();
-  const blockMinutes = rawBlock ? Number(rawBlock) : DEFAULT_BLOCK_MINUTES;
-  if (!Number.isFinite(blockMinutes) || blockMinutes < MIN_BLOCK_MINUTES) {
-    throw new Error(`FOCUS_TIME_BLOCK_MINUTES must be at least ${MIN_BLOCK_MINUTES} (got "${rawBlock}")`);
-  }
-
-  return { weeklyGoalMinutes, blockMinutes };
-}
-
-// Monday 00:00 through the following Monday 00:00, in HOME_TIMEZONE — the
-// week the weekly goal is tracked against. Independent of WORKING_DAYS (the
-// goal is about your week, not just the days you'd normally schedule
-// through) — though new blocks only ever land within working hours, same as
-// everything else findFreeSlots proposes into.
-export function getCurrentWeekRange(
-  config: SchedulingConfig,
-  now: Date = new Date()
-): { weekStart: Date; weekEnd: Date } {
-  const start = DateTime.fromJSDate(now, { zone: config.homeTimezone }).startOf('week');
-  return { weekStart: start.toJSDate(), weekEnd: start.plus({ weeks: 1 }).toJSDate() };
+  return { weeklyGoalMinutes, blockMinutes: getBlockMinutes() };
 }
 
 interface FocusTimeEvent {
@@ -103,7 +102,7 @@ interface PendingFocusProposal {
   interval: Interval;
 }
 
-async function fetchPendingFocusProposals(weekStart: Date, weekEnd: Date): Promise<PendingFocusProposal[]> {
+async function fetchPendingFocusProposals(rangeStart: Date, rangeEnd: Date): Promise<PendingFocusProposal[]> {
   const { data, error } = await supabase
     .from('proposed_changes')
     .select('id, proposed_start, proposed_end')
@@ -111,8 +110,8 @@ async function fetchPendingFocusProposals(weekStart: Date, weekEnd: Date): Promi
     .eq('category', 'focusTime')
     .eq('source_system', 'ai-engine')
     .in('status', ['pending', 'failed'])
-    .gte('proposed_start', weekStart.toISOString())
-    .lt('proposed_start', weekEnd.toISOString());
+    .gte('proposed_start', rangeStart.toISOString())
+    .lt('proposed_start', rangeEnd.toISOString());
   if (error) throw new Error(`proposed_changes read failed: ${error.message}`);
 
   return ((data ?? []) as ProposedChangeTimeRow[])
@@ -147,7 +146,7 @@ export interface FocusTimePlanSummary {
 export async function planFocusTime(now: Date = new Date()): Promise<FocusTimePlanSummary> {
   const config = getSchedulingConfig();
   const { weeklyGoalMinutes, blockMinutes } = getFocusTimeConfig();
-  const { weekStart, weekEnd } = getCurrentWeekRange(config, now);
+  const { periodStart: weekStart, periodEnd: weekEnd } = getCurrentWeekRange(config, now);
 
   const [existingEvents, pendingProposals] = await Promise.all([
     fetchFocusTimeEvents(weekStart, weekEnd, config),
@@ -245,7 +244,7 @@ export interface DeepWorkIndexStats {
 export async function getDeepWorkIndex(now: Date = new Date()): Promise<DeepWorkIndexStats> {
   const config = getSchedulingConfig();
   const { weeklyGoalMinutes } = getFocusTimeConfig();
-  const { weekStart, weekEnd } = getCurrentWeekRange(config, now);
+  const { periodStart: weekStart, periodEnd: weekEnd } = getCurrentWeekRange(config, now);
 
   const [existingEvents, pendingProposals] = await Promise.all([
     fetchFocusTimeEvents(weekStart, weekEnd, config),
@@ -270,4 +269,96 @@ export async function getDeepWorkIndex(now: Date = new Date()): Promise<DeepWork
     pendingProposalMinutes,
     deepWorkIndex: Math.round((completedMinutes / weeklyGoalMinutes) * 100),
   };
+}
+
+export interface FocusTimeSuggestOptions {
+  durationMinutes?: number;
+  maxOptions?: number;
+}
+
+export interface FocusTimeSuggestResult {
+  rangeStart: string;
+  rangeEnd: string;
+  durationMinutes: number;
+  options: ProposedChangeRow[];
+}
+
+// On-demand "find me focus time" — distinct from planFocusTime's weekly-goal
+// auto-fill. This doesn't compute or care about any goal shortfall; it just
+// answers "when could a block of this length fit in this window" and puts
+// each candidate into proposed_changes as its own pending row (still 'high'
+// priority / flexible — same auto-defend treatment as the goal-driven ones,
+// since a focus block is a focus block regardless of how it got proposed).
+// One candidate per distinct free opening (not repeated slices of the same
+// opening) so multiple options represent genuinely different times, not an
+// arbitrary subdivision of one long free afternoon. Since more than one
+// option can be approved independently, reject the ones you don't want —
+// there's no "picking one auto-cancels the others" behavior (yet).
+export async function suggestFocusTimeOptions(
+  rangeStart: Date,
+  rangeEnd: Date,
+  opts: FocusTimeSuggestOptions = {}
+): Promise<FocusTimeSuggestResult> {
+  if (rangeEnd.getTime() <= rangeStart.getTime()) {
+    throw new ValidationError('rangeEnd must be later than rangeStart');
+  }
+
+  const config = getSchedulingConfig();
+  const durationMinutes = opts.durationMinutes ?? getBlockMinutes();
+  if (!Number.isFinite(durationMinutes) || durationMinutes < MIN_BLOCK_MINUTES) {
+    throw new ValidationError(`durationMinutes must be at least ${MIN_BLOCK_MINUTES}`);
+  }
+
+  const maxOptions = opts.maxOptions ?? DEFAULT_MAX_SUGGEST_OPTIONS;
+  if (!Number.isInteger(maxOptions) || maxOptions < 1 || maxOptions > MAX_SUGGEST_OPTIONS_CAP) {
+    throw new ValidationError(`maxOptions must be an integer between 1 and ${MAX_SUGGEST_OPTIONS_CAP}`);
+  }
+
+  const result: FocusTimeSuggestResult = {
+    rangeStart: rangeStart.toISOString(),
+    rangeEnd: rangeEnd.toISOString(),
+    durationMinutes,
+    options: [],
+  };
+
+  const searchStart = new Date(Math.max(rangeStart.getTime(), Date.now()));
+  if (searchStart.getTime() >= rangeEnd.getTime()) {
+    return result;
+  }
+
+  const [{ slots }, pendingProposals] = await Promise.all([
+    findFreeSlots(searchStart, rangeEnd, { minDurationMinutes: durationMinutes, config }),
+    fetchPendingFocusProposals(rangeStart, rangeEnd),
+  ]);
+
+  // Pending proposals (from a previous /suggest call, or from planFocusTime)
+  // aren't real calendar events yet, so findFreeSlots still sees their time
+  // as open — carve it back out so this doesn't offer the same slot twice.
+  const pendingIntervals = mergeIntervals(pendingProposals.map((p) => p.interval));
+  const openSlots = subtractIntervals(slots, pendingIntervals);
+
+  const candidates: Interval[] = [];
+  for (const slot of openSlots) {
+    if (candidates.length >= maxOptions) break;
+    const slotMinutes = Math.round((slot.end - slot.start) / 60_000);
+    if (slotMinutes < durationMinutes) continue;
+    candidates.push({ start: slot.start, end: slot.start + durationMinutes * 60_000 });
+  }
+
+  for (let i = 0; i < candidates.length; i++) {
+    const proposal = await createProposedChange({
+      change_type: 'create',
+      category: 'focusTime',
+      flexible: 'true',
+      priority: 'high',
+      source_system: 'ai-engine',
+      proposed_summary: 'Focus Time',
+      proposed_start: new Date(candidates[i].start).toISOString(),
+      proposed_end: new Date(candidates[i].end).toISOString(),
+      reason: `Option ${i + 1} of ${candidates.length} for a requested focus-time slot`,
+    });
+    result.options.push(proposal);
+  }
+
+  return result;
 }

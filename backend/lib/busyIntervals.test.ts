@@ -15,29 +15,22 @@ function fakeEvent(overrides: Partial<calendar_v3.Schema$Event>): calendar_v3.Sc
 }
 
 describe('normalizeEventToInterval', () => {
-  it('blocks the full home-timezone day for a single-day all-day event', () => {
+  it('treats a single-day all-day event as a note, not busy time', () => {
     const event = fakeEvent({
       start: { date: '2026-07-01' },
       end: { date: '2026-07-02' }, // exclusive, per Google's all-day semantics
     });
 
-    const result = normalizeEventToInterval(event, HOME_TIMEZONE);
-
-    expect(result?.isAllDay).toBe(true);
-    expect(result?.start).toBe(DateTime.fromISO('2026-07-01', { zone: HOME_TIMEZONE }).startOf('day').toMillis());
-    expect(result?.end).toBe(DateTime.fromISO('2026-07-02', { zone: HOME_TIMEZONE }).startOf('day').toMillis());
+    expect(normalizeEventToInterval(event, HOME_TIMEZONE)).toBeNull();
   });
 
-  it('blocks the full home-timezone day range for a multi-day all-day event', () => {
+  it('treats a multi-day all-day event as a note, not busy time — never blocks its whole date range', () => {
     const event = fakeEvent({
       start: { date: '2026-07-01' },
       end: { date: '2026-07-04' },
     });
 
-    const result = normalizeEventToInterval(event, HOME_TIMEZONE);
-
-    expect(result?.isAllDay).toBe(true);
-    expect(result!.end - result!.start).toBe(3 * 24 * 60 * 60 * 1000);
+    expect(normalizeEventToInterval(event, HOME_TIMEZONE)).toBeNull();
   });
 
   it('resolves a timed event using its own timeZone, independent of the home timezone', () => {

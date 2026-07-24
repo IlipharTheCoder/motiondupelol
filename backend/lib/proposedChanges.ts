@@ -3,16 +3,22 @@ import { supabase } from './supabase';
 import {
   encodeEventMetadata,
   decodeEventMetadata,
+  encodeEventTags,
   CATEGORY_COLORS,
   EVENT_PRIORITIES,
+  PRIORITY_RANK,
   type BurnerEventType,
   type SourceSystem,
   type EventPriority,
 } from './eventMetadata';
-import { detectConflicts } from './freeSlots';
+import { detectConflicts, findFreeSlots } from './freeSlots';
+import { getSchedulingConfig } from './schedulingConfig';
+import { mergeIntervals, subtractIntervals, filterByMinDuration, type Interval } from './intervals';
+import type { BusyInterval } from './busyIntervals';
 import { normalizeTags } from './normalizeTags';
 
 const BURNER_CALENDAR_ID = process.env.GOOGLE_BURNER_CALENDAR_ID!;
+const BUMP_SEARCH_HORIZON_DAYS = 14;
 
 export type ChangeType = 'create' | 'move' | 'update' | 'delete';
 export type ProposalStatus = 'pending' | 'applied' | 'rejected' | 'failed';
@@ -35,8 +41,10 @@ export interface ProposedChangeInput {
   proposed_description?: string;
   priority?: EventPriority;
   tags?: string[];
+  duration_minutes?: number;
   deadline?: string;
   reason?: string;
+  bump_if_movable?: boolean;
 }
 
 export interface ProposedChangeRow extends ProposedChangeInput {
@@ -51,8 +59,24 @@ export interface ProposedChangeRow extends ProposedChangeInput {
   updated_at: string;
 }
 
+// Guards the `tasks` link-back side effects below — `source_id` on a 'task'
+// create/update isn't always a `tasks.id` (e.g. the Todoist intake shape
+// uses it for Todoist's own external id), so only attempt the tasks-table
+// update when it's actually UUID-shaped.
+function isUuid(value: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
+}
+
 const CHANGE_TYPES: ChangeType[] = ['create', 'move', 'update', 'delete'];
-const BURNER_EVENT_TYPES: BurnerEventType[] = ['task', 'habit', 'focusTime', 'meeting', 'fixed', 'buffer'];
+const BURNER_EVENT_TYPES: BurnerEventType[] = [
+  'task',
+  'habit',
+  'focusTime',
+  'meeting',
+  'fixed',
+  'buffer',
+  'personal',
+];
 
 export function validateProposalInput(input: ProposedChangeInput): void {
   if (!CHANGE_TYPES.includes(input.change_type)) {
@@ -63,6 +87,18 @@ export function validateProposalInput(input: ProposedChangeInput): void {
   }
   if (input.priority && !EVENT_PRIORITIES.includes(input.priority)) {
     throw new ValidationError(`"priority" must be one of ${EVENT_PRIORITIES.join(', ')}`);
+  }
+  if (
+    input.duration_minutes !== undefined &&
+    (!Number.isFinite(input.duration_minutes) || input.duration_minutes <= 0)
+  ) {
+    throw new ValidationError('"duration_minutes" must be a positive number');
+  }
+  if (input.bump_if_movable !== undefined && typeof input.bump_if_movable !== 'boolean') {
+    throw new ValidationError('"bump_if_movable" must be a boolean');
+  }
+  if (input.bump_if_movable && input.change_type !== 'create' && input.change_type !== 'move') {
+    throw new ValidationError('"bump_if_movable" is only meaningful for "create" or "move"');
   }
 
   switch (input.change_type) {
@@ -107,10 +143,12 @@ export function validateProposalInput(input: ProposedChangeInput): void {
         !input.proposed_summary &&
         !input.proposed_description &&
         !input.priority &&
-        !input.deadline
+        !input.deadline &&
+        !input.source_id &&
+        input.tags === undefined
       ) {
         throw new ValidationError(
-          '"update" requires at least one of "proposed_start", "proposed_end", "proposed_summary", "proposed_description", "priority", or "deadline"'
+          '"update" requires at least one of "proposed_start", "proposed_end", "proposed_summary", "proposed_description", "priority", "deadline", "tags", or "source_id" (to link a task — see lib/aiTasks.ts)'
         );
       }
       break;
@@ -164,6 +202,102 @@ async function updateProposedChange(
   return data as ProposedChangeRow;
 }
 
+interface BumpOutcome {
+  message: string;
+}
+
+// Phase 3.5 item 24, "bump if movable" — opt-in per-proposal (bump_if_movable),
+// deliberately not the new default: today's "conflict = fail" behavior is
+// already shipped and relied on elsewhere. Only ever attempted for a real
+// calendar create/move (see the call site below).
+//
+// All-or-nothing: every single conflicting event must be flexible and
+// strictly lower priority than `row` itself, or nothing gets bumped — a
+// partial bump wouldn't actually free the slot for `row` anyway. Each
+// resolvable conflict gets its own ordinary `move` proposal (reusing
+// lib/autoReschedule.ts-style relocation), but `row` itself is never applied
+// here even when every conflict resolves — the occupant(s) haven't actually
+// vacated the slot yet, only proposed to. `row` is left `failed` with a
+// message pointing at what to approve first, reusing the existing
+// failed-proposal retry flow rather than inventing a new status.
+//
+// The occupant moves are created with skipAutoApply — deliberately bypassing
+// AUTO_APPLY_CATEGORIES regardless of its configuration, so a bump can never
+// silently cascade onto the real calendar without a manual approve. This is
+// the "hard manual option ... to override" the user explicitly asked for.
+async function attemptBump(row: ProposedChangeRow, conflicts: BusyInterval[]): Promise<BumpOutcome> {
+  const fallbackMessage = `Conflicts with existing event(s): ${conflicts
+    .map((c) => c.summary ?? c.eventId)
+    .join(', ')}`;
+  const newItemRank = PRIORITY_RANK[row.priority ?? 'medium'];
+
+  const occupants: { eventId: string; summary: string | null; category: BurnerEventType; durationMs: number }[] = [];
+  for (const conflict of conflicts) {
+    const { data: event } = await calendar.events.get({
+      calendarId: BURNER_CALENDAR_ID,
+      eventId: conflict.eventId,
+    });
+    const meta = decodeEventMetadata(event.extendedProperties);
+    const occupantRank = PRIORITY_RANK[meta.priority ?? 'medium'];
+    if (meta.flexible !== 'true' || occupantRank <= newItemRank) {
+      return { message: fallbackMessage };
+    }
+    occupants.push({
+      eventId: conflict.eventId,
+      summary: conflict.summary,
+      category: meta.type ?? 'meeting',
+      durationMs: conflict.end - conflict.start,
+    });
+  }
+
+  const config = getSchedulingConfig();
+  const searchStart = new Date();
+  const searchEnd = new Date(searchStart.getTime() + BUMP_SEARCH_HORIZON_DAYS * 24 * 60 * 60 * 1000);
+
+  // Claimed-interval tracking across occupants being bumped in the same
+  // attempt, so two occupants never get proposed into the same newly-free
+  // slot (same fix already applied in lib/dayRebalance.ts after this exact
+  // bug was caught live there).
+  let claimedIntervals: Interval[] = [];
+  const relocations: { occupant: (typeof occupants)[number]; start: number; end: number }[] = [];
+
+  for (const occupant of occupants) {
+    const durationMinutes = Math.max(1, Math.round(occupant.durationMs / 60_000));
+    const { slots } = await findFreeSlots(searchStart, searchEnd, { minDurationMinutes: durationMinutes, config });
+    const fitting = filterByMinDuration(subtractIntervals(slots, claimedIntervals), durationMinutes);
+    if (fitting.length === 0) {
+      return { message: fallbackMessage };
+    }
+    const chosenStart = fitting[0].start;
+    const chosenEnd = chosenStart + occupant.durationMs;
+    relocations.push({ occupant, start: chosenStart, end: chosenEnd });
+    claimedIntervals = mergeIntervals([...claimedIntervals, { start: chosenStart, end: chosenEnd }]);
+  }
+
+  const proposalIds: string[] = [];
+  for (const { occupant, start, end } of relocations) {
+    const proposal = await createProposedChange(
+      {
+        change_type: 'move',
+        category: occupant.category,
+        source_system: 'ai-engine',
+        target_event_id: occupant.eventId,
+        proposed_start: new Date(start).toISOString(),
+        proposed_end: new Date(end).toISOString(),
+        reason: `Bumped to make room for "${row.proposed_summary ?? row.id}"`,
+      },
+      { skipAutoApply: true }
+    );
+    proposalIds.push(proposal.id);
+  }
+
+  const plural = proposalIds.length > 1;
+  const summaries = occupants.map((o) => o.summary ?? o.eventId).join(', ');
+  return {
+    message: `Blocked pending approval of relocating ${summaries} (proposal id${plural ? 's' : ''} ${proposalIds.join(', ')}) — approve ${plural ? 'those' : 'that'} first, then retry this one.`,
+  };
+}
+
 export async function applyProposedChange(
   row: ProposedChangeRow,
   decidedBy: DecidedBy
@@ -179,6 +313,10 @@ export async function applyProposedChange(
         { excludeEventId: row.target_event_id ?? undefined }
       );
       if (hasConflict) {
+        if (row.bump_if_movable) {
+          const outcome = await attemptBump(row, conflicts);
+          throw new Error(outcome.message);
+        }
         const summaries = conflicts.map((c) => c.summary ?? c.eventId).join(', ');
         throw new Error(`Conflicts with existing event(s): ${summaries}`);
       }
@@ -206,11 +344,22 @@ export async function applyProposedChange(
               priority: row.priority ?? 'medium',
               colorTag: CATEGORY_COLORS[row.category],
               deadline: row.deadline ?? '',
+              tags: encodeEventTags(row.tags ?? []),
             }),
           },
         },
       });
       resultingEventId = data.id!;
+
+      // If this create was "schedule this task onto the calendar" (lib/aiTasks.ts),
+      // row.source_id is the tasks.id, not an external id — close the loop by
+      // marking that task scheduled and pointing it at the new event.
+      if (row.category === 'task' && row.source_id && isUuid(row.source_id)) {
+        await supabase
+          .from('tasks')
+          .update({ status: 'scheduled', scheduled_event_id: resultingEventId })
+          .eq('id', row.source_id);
+      }
     } else if (row.change_type === 'create') {
       // No proposed_start/proposed_end: a task-list intake (architecture-plan.md
       // section 4a), not a calendar write — insert into `tasks` instead, and
@@ -224,6 +373,7 @@ export async function applyProposedChange(
           deadline: row.deadline ?? null,
           priority: row.priority ?? null,
           tags: row.tags ?? [],
+          duration_minutes: row.duration_minutes ?? null,
           source_system: row.source_system,
           source_id: row.source_id ?? null,
           status: 'unscheduled',
@@ -253,6 +403,13 @@ export async function applyProposedChange(
       });
       const existingMeta = decodeEventMetadata(existing.extendedProperties);
 
+      // row.source_id is only ever explicitly set on an 'update' proposal for
+      // one reason today: linking a task to this already-existing event
+      // (lib/aiTasks.ts) — in which case the new value should win over
+      // whatever origin metadata the event already had. Absent that, origin
+      // metadata is preserved (existingMeta wins), same as before.
+      const isTaskLink = !!row.source_id;
+
       await calendar.events.patch({
         calendarId: BURNER_CALENDAR_ID,
         eventId: row.target_event_id!,
@@ -266,17 +423,33 @@ export async function applyProposedChange(
               schemaVersion: '1',
               type: existingMeta.type ?? row.category,
               flexible: row.flexible ?? existingMeta.flexible ?? 'true',
-              sourceSystem: existingMeta.sourceSystem ?? row.source_system,
-              sourceId: existingMeta.sourceId ?? row.source_id ?? row.id,
+              sourceSystem: isTaskLink ? row.source_system : existingMeta.sourceSystem ?? row.source_system,
+              sourceId: isTaskLink ? row.source_id! : existingMeta.sourceId ?? row.source_id ?? row.id,
               sourceCalendarId: existingMeta.sourceCalendarId ?? '',
               sourceLabel: existingMeta.sourceLabel ?? '',
               priority: row.priority ?? existingMeta.priority ?? 'medium',
               colorTag: CATEGORY_COLORS[existingMeta.type ?? row.category],
               deadline: row.deadline ?? existingMeta.deadline ?? '',
+              // Replace-if-provided, preserve-if-omitted — same fallback
+              // style as every other field above. Bulk-edit's add/remove
+              // semantics (lib/bulkEdit.ts) are a layer computed before
+              // calling createProposedChange, not a change to this
+              // single-event primitive's own replace behavior.
+              tags:
+                row.tags !== undefined && row.tags !== null
+                  ? encodeEventTags(row.tags)
+                  : existingMeta.tags ?? '',
             }),
           },
         },
       });
+
+      if (isTaskLink && isUuid(row.source_id!)) {
+        await supabase
+          .from('tasks')
+          .update({ status: 'scheduled', scheduled_event_id: row.target_event_id })
+          .eq('id', row.source_id!);
+      }
     } else if (row.change_type === 'delete') {
       await calendar.events.delete({
         calendarId: BURNER_CALENDAR_ID,
@@ -311,7 +484,10 @@ export async function applyProposedChange(
   }
 }
 
-export async function createProposedChange(input: ProposedChangeInput): Promise<ProposedChangeRow> {
+export async function createProposedChange(
+  input: ProposedChangeInput,
+  options: { skipAutoApply?: boolean } = {}
+): Promise<ProposedChangeRow> {
   validateProposalInput(input);
 
   const { data, error } = await supabase
@@ -327,6 +503,13 @@ export async function createProposedChange(input: ProposedChangeInput): Promise<
   if (error) throw new Error(`proposed_changes insert failed: ${error.message}`);
 
   const row = data as ProposedChangeRow;
+  // skipAutoApply is internal-only (no public route exposes it) — used by
+  // attemptBump above so a bump-created move can never silently cascade onto
+  // the real calendar via AUTO_APPLY_CATEGORIES, regardless of its
+  // configuration. Every other caller gets the normal auto-apply check.
+  if (options.skipAutoApply) {
+    return row;
+  }
   const autoApplyCategories = getAutoApplyCategories();
   if (autoApplyCategories.has(row.category)) {
     return applyProposedChange(row, 'auto-apply-policy');
@@ -361,7 +544,7 @@ export async function rejectProposedChange(id: string): Promise<ProposedChangeRo
 // any pending/failed proposal can be corrected the same way before approving.
 export async function updateProposedChangeFields(
   id: string,
-  patch: { priority?: EventPriority; tags?: string[] }
+  patch: { priority?: EventPriority; tags?: string[]; duration_minutes?: number }
 ): Promise<ProposedChangeRow> {
   const row = await getProposedChange(id);
   if (row.status !== 'pending' && row.status !== 'failed') {
@@ -378,8 +561,14 @@ export async function updateProposedChangeFields(
   if (patch.tags !== undefined) {
     update.tags = normalizeTags(patch.tags);
   }
+  if (patch.duration_minutes !== undefined) {
+    if (!Number.isFinite(patch.duration_minutes) || patch.duration_minutes <= 0) {
+      throw new ValidationError('"duration_minutes" must be a positive number');
+    }
+    update.duration_minutes = patch.duration_minutes;
+  }
   if (Object.keys(update).length === 0) {
-    throw new ValidationError('At least one of "priority" or "tags" is required');
+    throw new ValidationError('At least one of "priority", "tags", or "duration_minutes" is required');
   }
 
   return updateProposedChange(id, update);
