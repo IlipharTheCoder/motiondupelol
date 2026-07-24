@@ -6,6 +6,7 @@ import {
   encodeEventTags,
   CATEGORY_COLORS,
   EVENT_PRIORITIES,
+  BURNER_EVENT_TYPES,
   PRIORITY_RANK,
   type BurnerEventType,
   type SourceSystem,
@@ -68,15 +69,6 @@ function isUuid(value: string): boolean {
 }
 
 const CHANGE_TYPES: ChangeType[] = ['create', 'move', 'update', 'delete'];
-const BURNER_EVENT_TYPES: BurnerEventType[] = [
-  'task',
-  'habit',
-  'focusTime',
-  'meeting',
-  'fixed',
-  'buffer',
-  'personal',
-];
 
 export function validateProposalInput(input: ProposedChangeInput): void {
   if (!CHANGE_TYPES.includes(input.change_type)) {

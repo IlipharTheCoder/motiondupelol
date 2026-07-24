@@ -1,6 +1,15 @@
 import { normalizeTags } from './normalizeTags';
 
 export type BurnerEventType = 'task' | 'habit' | 'focusTime' | 'meeting' | 'fixed' | 'buffer' | 'personal';
+export const BURNER_EVENT_TYPES: BurnerEventType[] = [
+  'task',
+  'habit',
+  'focusTime',
+  'meeting',
+  'fixed',
+  'buffer',
+  'personal',
+];
 export type SourceSystem = 'todoist' | 'canvas' | 'google' | 'manual' | 'ai-engine';
 export type EventPriority = 'critical' | 'high' | 'medium' | 'low';
 export const EVENT_PRIORITIES: EventPriority[] = ['critical', 'high', 'medium', 'low'];

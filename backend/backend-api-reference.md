@@ -19,7 +19,7 @@ Keep this updated as new routes are added. Purpose: so building a new endpoint d
 
 **Auth:** required — `x-api-key` header must match `APP_SECRET_KEY`
 
-**Response:** array of rows from `inbox_items` (see `docs/schema.md`)
+**Response:** array of rows from `inbox_items` (see `backend-schema.md`)
 ```json
 [
   {
@@ -97,7 +97,7 @@ Tags are normalized (trimmed, lowercased, deduped) before insert via `normalizeT
 
 **Errors:** `401` unauthorized, `400` if no image provided, `500` if upload fails, Claude call fails, JSON parsing fails, or the insert fails — each returns `{ "error": message }`
 
-**Status:** `app/api/capture/route.ts` is currently an empty file — despite this doc previously claiming it was written, there is no implementation yet. Deprioritized per `docs/backend-build-order.md` Phase 6; the description above is the intended behavior, not yet-built reality.
+**Status:** `app/api/capture/` doesn't exist in the codebase at all (confirmed 2026-07-24 — not even an empty stub file, the whole route directory is absent) — despite this doc and `backend-build-order.md`'s "Already done"/Phase 6 sections previously claiming it was written. Deprioritized per `backend-build-order.md` Phase 6; the description above is the intended behavior if/when it gets built, not current reality. Don't include this as a callable tool for the NL layer.
 
 ---
 
@@ -379,6 +379,53 @@ Bounded to ~50s of work per call (Vercel `maxDuration: 60`). If a backfill is la
 
 ---
 
+## `POST /api/calendar/recurring`
+
+**Auth:** required — same as above
+
+**Request:** `application/json`:
+```json
+{
+  "category": "task | habit | focusTime | meeting | fixed | buffer | personal (required)",
+  "proposed_summary": "string (required)",
+  "proposed_description": "string (optional)",
+  "priority": "critical | high | medium | low (optional)",
+  "flexible": "true | false (optional)",
+  "first_start": "ISO datetime (required) — the first occurrence's start; its weekday and time-of-day anchor every later occurrence",
+  "first_end": "ISO datetime (required) — defines the duration applied to every occurrence",
+  "interval_weeks": "integer, positive (optional, default 1) — 1 = every week, 2 = every other week",
+  "count": "integer, positive, at most 260 — exactly one of count/until is required",
+  "until": "ISO datetime — exactly one of count/until is required",
+  "tags": "string[] (optional) — merged with the auto-generated series tag, not a replacement for it",
+  "bump_if_movable": "boolean (optional, default false) — applied to every occurrence's create proposal, see item 24",
+  "reason": "string (optional, carried into every resulting proposal)"
+}
+```
+
+**What it does:** Phase 5 item 25 ("Recurring events"), Option B — synthesizes N individual `create` proposals (one per occurrence) rather than a native Google `recurrence`/RRULE series, chosen specifically because items 13/14 (event tags + `POST /api/calendar/bulk-edit`) already solve Option B's usual weakness of having no way to treat the whole series as one unit. Every occurrence is tagged with a fresh, unique `series:<uuid>` (plus any `tags` you supply) — **save this tag from the response** to later edit or cancel the whole series via `POST /api/calendar/bulk-edit`.
+
+Each occurrence is an ordinary `create` proposal, going through the exact same review-queue path and per-instance `detectConflicts` check as any other create — a conflict on one occurrence fails only that one proposal, the rest are unaffected. Weekly cadence only (anchored to `first_start`'s own weekday and time-of-day); interval math is DST-safe (stays at the same local time-of-day across a spring-forward/fall-back transition between occurrences).
+
+**No default horizon — `count` or `until` is required, not both, not neither.** This is a deliberate choice: there's no "silently ran out" failure mode to worry about, but also no "recurring forever" in one call — a still-wanted indefinite series just means calling this again later with a new `first_start`. A hard ceiling of 260 occurrences (5 years weekly) applies regardless; if an `until`-bounded request would exceed it, the response comes back `truncated: true` with as many occurrences as fit.
+
+**Response:**
+```json
+{
+  "seriesTag": "series:<uuid>",
+  "occurrencesRequested": 0,
+  "truncated": false,
+  "proposalsCreated": 0,
+  "skippedErrors": 0,
+  "results": [
+    { "index": 1, "start": "ISO datetime", "end": "ISO datetime", "outcome": "proposed | skipped-error", "proposal": {}, "reason": "string" }
+  ]
+}
+```
+
+**Errors:** `401` unauthorized, `400` on a missing/invalid `category`/`proposed_summary`/`first_start`/`first_end`/`interval_weeks`/`count`/`until`/`tags`/`bump_if_movable`, `500` on a Google API or Supabase failure. On-demand only — nothing in this backend runs on a schedule yet.
+
+---
+
 ## `POST /api/focus-time/plan`
 
 **Auth:** required — same as above
@@ -622,6 +669,8 @@ Same on-demand-only shape as `POST /api/calendar/sync` — nothing in this backe
 ---
 
 ## `POST /api/canvas/sync`
+
+**Status: currently non-functional, on hiatus (as of 2026-07-24) — pending the user's school admin approving Canvas API access.** `CANVAS_API_TOKEN` is unset; `CANVAS_BASE_URL` currently holds a bare label ("upenn"), not a full URL, and will need fixing to something like `https://upenn.instructure.com` once a token is available — calling this today will 500. Code is complete and was designed/reviewed, just never live-verified against a real Canvas account. Don't present this as a working tool to the NL layer until both env vars are set correctly and it's been re-verified live.
 
 **Auth:** required — same as above
 
@@ -892,7 +941,10 @@ A task too big for any single opening anywhere in the window is skipped with a r
 
 ## Not yet built
 
+- **Item 20, source-system-aware auto-apply** — `AUTO_APPLY_CATEGORIES` only keys on `category`, not `source_system`. There is currently no way to auto-apply chat/NL-originated changes while still holding e.g. Todoist imports back for review — every `proposed_changes` row the NL layer creates (other than direct-insert `POST /api/tasks`/`POST /api/habits`, which bypass the queue entirely) sits `pending` needing a manual approval tap, regardless of how directly the user stated it. Worth an explicit decision before/while building the chat layer — either build this, or deliberately accept "everything the NL layer proposes onto the calendar needs a manual tap" as the v1 posture.
 - AI Tasks Part 3 — session-splitting for tasks too large for any single free opening (Phase 3 item 7; Parts 1 and 2 are done — manual link/create via `POST /api/tasks/{id}/schedule`, auto-placement via `POST /api/tasks/plan`)
 - A deadline-driven reprioritization method that lets deadline/period urgency override priority tier for either Tasks or Habits (today's ranking always lets tier win — a future, distinct item)
 - Per-habit preferred time-of-day windows (e.g. "only evenings")
 - The cross-feature "AI Planner" orchestration layer (Phase 3 item 11) that would arbitrate Tasks/Habits/Focus Time/Buffers against each other for the same calendar time — each planner today only coordinates through shared calendar/pending-proposal state, independently triggered
+- Item 15, weekly time-spend reports; item 16, follow-up reminder notifications — both Phase 4, not started, lower priority
+- `POST /api/capture` (screenshot → Claude vision → inbox row) — see its own entry above; not implemented at all, don't list as a callable tool
