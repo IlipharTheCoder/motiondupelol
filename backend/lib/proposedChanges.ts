@@ -1,9 +1,11 @@
+import { randomUUID } from 'crypto';
 import { calendar } from './googleCalendar';
 import { supabase } from './supabase';
 import {
   encodeEventMetadata,
   decodeEventMetadata,
   encodeEventTags,
+  decodeEventTags,
   CATEGORY_COLORS,
   EVENT_PRIORITIES,
   BURNER_EVENT_TYPES,
@@ -17,9 +19,16 @@ import { getSchedulingConfig } from './schedulingConfig';
 import { mergeIntervals, subtractIntervals, filterByMinDuration, type Interval } from './intervals';
 import type { BusyInterval } from './busyIntervals';
 import { normalizeTags } from './normalizeTags';
+import { checkCandidateAgainstRules } from './schedulingRules';
+import { fetchApplicableSchedulingRules } from './schedulingRulesQuery';
 
 const BURNER_CALENDAR_ID = process.env.GOOGLE_BURNER_CALENDAR_ID!;
 const BUMP_SEARCH_HORIZON_DAYS = 14;
+// Sanity ceiling on one batch request — not a product limit, just a guard
+// against a single call fanning out into an unreasonable number of writes.
+// Same "guard, not a real limit" framing as recurringOccurrences.ts's
+// MAX_OCCURRENCES.
+export const MAX_BATCH_SIZE = 50;
 
 export type ChangeType = 'create' | 'move' | 'update' | 'delete';
 export type ProposalStatus = 'pending' | 'applied' | 'rejected' | 'failed';
@@ -46,6 +55,25 @@ export interface ProposedChangeInput {
   deadline?: string;
   reason?: string;
   bump_if_movable?: boolean;
+  ignore_scheduling_rules?: boolean;
+}
+
+// Phase 3.5 item 28 ("undo") — a snapshot of only the fields a given
+// change_type actually overwrites, taken immediately before the write. A
+// `move` only ever touches start/end, so its snapshot leaves every other
+// field null; `update`/`delete` capture the full revertible shape since any
+// of those fields could have changed. Never client-settable — see the
+// `previous_state: null` override in createProposedChange below.
+export interface PreviousEventState {
+  summary: string | null;
+  description: string | null;
+  start: string | null;
+  end: string | null;
+  category: BurnerEventType | null;
+  priority: EventPriority | null;
+  flexible: 'true' | 'false' | null;
+  deadline: string | null;
+  tags: string[];
 }
 
 export interface ProposedChangeRow extends ProposedChangeInput {
@@ -56,6 +84,8 @@ export interface ProposedChangeRow extends ProposedChangeInput {
   decided_at: string | null;
   applied_at: string | null;
   error_message: string | null;
+  previous_state: PreviousEventState | null;
+  proposal_group_id: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -91,6 +121,12 @@ export function validateProposalInput(input: ProposedChangeInput): void {
   }
   if (input.bump_if_movable && input.change_type !== 'create' && input.change_type !== 'move') {
     throw new ValidationError('"bump_if_movable" is only meaningful for "create" or "move"');
+  }
+  if (input.ignore_scheduling_rules !== undefined && typeof input.ignore_scheduling_rules !== 'boolean') {
+    throw new ValidationError('"ignore_scheduling_rules" must be a boolean');
+  }
+  if (input.ignore_scheduling_rules && input.change_type !== 'create' && input.change_type !== 'move') {
+    throw new ValidationError('"ignore_scheduling_rules" is only meaningful for "create" or "move"');
   }
 
   switch (input.change_type) {
@@ -130,10 +166,10 @@ export function validateProposalInput(input: ProposedChangeInput): void {
         throw new ValidationError('"update" requires "target_event_id"');
       }
       if (
-        !input.proposed_start &&
-        !input.proposed_end &&
-        !input.proposed_summary &&
-        !input.proposed_description &&
+        input.proposed_start === undefined &&
+        input.proposed_end === undefined &&
+        input.proposed_summary === undefined &&
+        input.proposed_description === undefined &&
         !input.priority &&
         !input.deadline &&
         !input.source_id &&
@@ -223,7 +259,13 @@ async function attemptBump(row: ProposedChangeRow, conflicts: BusyInterval[]): P
     .join(', ')}`;
   const newItemRank = PRIORITY_RANK[row.priority ?? 'medium'];
 
-  const occupants: { eventId: string; summary: string | null; category: BurnerEventType; durationMs: number }[] = [];
+  const occupants: {
+    eventId: string;
+    summary: string | null;
+    category: BurnerEventType;
+    tags: string[];
+    durationMs: number;
+  }[] = [];
   for (const conflict of conflicts) {
     const { data: event } = await calendar.events.get({
       calendarId: BURNER_CALENDAR_ID,
@@ -238,6 +280,7 @@ async function attemptBump(row: ProposedChangeRow, conflicts: BusyInterval[]): P
       eventId: conflict.eventId,
       summary: conflict.summary,
       category: meta.type ?? 'meeting',
+      tags: decodeEventTags(meta.tags),
       durationMs: conflict.end - conflict.start,
     });
   }
@@ -255,7 +298,12 @@ async function attemptBump(row: ProposedChangeRow, conflicts: BusyInterval[]): P
 
   for (const occupant of occupants) {
     const durationMinutes = Math.max(1, Math.round(occupant.durationMs / 60_000));
-    const { slots } = await findFreeSlots(searchStart, searchEnd, { minDurationMinutes: durationMinutes, config });
+    const { slots } = await findFreeSlots(searchStart, searchEnd, {
+      minDurationMinutes: durationMinutes,
+      config,
+      category: occupant.category,
+      tags: occupant.tags,
+    });
     const fitting = filterByMinDuration(subtractIntervals(slots, claimedIntervals), durationMinutes);
     if (fitting.length === 0) {
       return { message: fallbackMessage };
@@ -299,6 +347,29 @@ export async function applyProposedChange(
   try {
     const isCalendarCreate = row.change_type === 'create' && !!row.proposed_start && !!row.proposed_end;
     if (isCalendarCreate || row.change_type === 'move') {
+      // Phase 3.5 item 30 — standing scheduling rules, checked before
+      // conflict detection and independent of bump_if_movable (a rule
+      // violation isn't fixable by relocating whoever else is occupying the
+      // slot — the time itself is disallowed regardless of what's there).
+      // Only ignore_scheduling_rules bypasses this, never bump_if_movable.
+      // Uses row.tags for both create and move — for 'move' this is the
+      // proposal's own input tags, not necessarily the target event's real
+      // current tags (see backend-schema.md's scheduling_rules entry for
+      // the known v1 scoping limit this creates for tag-scoped rules).
+      if (!row.ignore_scheduling_rules) {
+        const rules = await fetchApplicableSchedulingRules(row.category, row.tags ?? []);
+        if (rules.length > 0) {
+          const violation = checkCandidateAgainstRules(
+            new Date(row.proposed_start!),
+            rules,
+            getSchedulingConfig().homeTimezone
+          );
+          if (violation) {
+            throw new Error(violation.message);
+          }
+        }
+      }
+
       const { hasConflict, conflicts } = await detectConflicts(
         new Date(row.proposed_start!),
         new Date(row.proposed_end!),
@@ -315,6 +386,9 @@ export async function applyProposedChange(
     }
 
     let resultingEventId = row.target_event_id ?? null;
+    // Populated below for move/update/delete — a create has nothing to
+    // restore (revert of a create just deletes the resulting event).
+    let previousState: PreviousEventState | null = null;
 
     if (row.change_type === 'create' && isCalendarCreate) {
       const { data } = await calendar.events.insert({
@@ -380,6 +454,25 @@ export async function applyProposedChange(
         .eq('proposed_change_id', row.id);
       if (syncedTasksError) throw new Error(`synced_tasks link failed: ${syncedTasksError.message}`);
     } else if (row.change_type === 'move') {
+      // A move only ever changes start/end, so that's all the pre-write read
+      // (added for item 28) needs to capture — everything else on the event
+      // is untouched by this change_type.
+      const { data: existingForMove } = await calendar.events.get({
+        calendarId: BURNER_CALENDAR_ID,
+        eventId: row.target_event_id!,
+      });
+      previousState = {
+        summary: null,
+        description: null,
+        start: existingForMove.start?.dateTime ?? null,
+        end: existingForMove.end?.dateTime ?? null,
+        category: null,
+        priority: null,
+        flexible: null,
+        deadline: null,
+        tags: [],
+      };
+
       await calendar.events.patch({
         calendarId: BURNER_CALENDAR_ID,
         eventId: row.target_event_id!,
@@ -394,6 +487,20 @@ export async function applyProposedChange(
         eventId: row.target_event_id!,
       });
       const existingMeta = decodeEventMetadata(existing.extendedProperties);
+      // This read already has to happen for Google's patch (below) to resend
+      // the full extendedProperties map — item 28 captures the pre-write
+      // shape here rather than discarding it, at no extra API cost.
+      previousState = {
+        summary: existing.summary ?? null,
+        description: existing.description ?? null,
+        start: existing.start?.dateTime ?? null,
+        end: existing.end?.dateTime ?? null,
+        category: existingMeta.type ?? null,
+        priority: existingMeta.priority ?? null,
+        flexible: existingMeta.flexible ?? null,
+        deadline: existingMeta.deadline || null,
+        tags: decodeEventTags(existingMeta.tags),
+      };
 
       // row.source_id is only ever explicitly set on an 'update' proposal for
       // one reason today: linking a task to this already-existing event
@@ -406,10 +513,22 @@ export async function applyProposedChange(
         calendarId: BURNER_CALENDAR_ID,
         eventId: row.target_event_id!,
         requestBody: {
-          ...(row.proposed_summary ? { summary: row.proposed_summary } : {}),
-          ...(row.proposed_description ? { description: row.proposed_description } : {}),
-          ...(row.proposed_start ? { start: { dateTime: row.proposed_start } } : {}),
-          ...(row.proposed_end ? { end: { dateTime: row.proposed_end } } : {}),
+          // != null (catches both undefined AND a real SQL null — a row
+          // fetched back from Supabase reports an unset column as `null`,
+          // never `undefined`), not truthy — a caller (item 28's revert, in
+          // particular) needs to be able to explicitly restore a field to
+          // "" (e.g. clearing a description back to none), which a
+          // truthiness check would silently treat as "field not specified,
+          // leave alone." A field genuinely absent (null/undefined) still
+          // means "don't touch it" — sending Google a literal `null`
+          // dateTime, which the earlier (buggy) `!== undefined` version of
+          // this check did for every untouched proposed_start/proposed_end,
+          // fails with a confusing Google-side "start/end must both be date
+          // or both be dateTime" error caught live while testing this.
+          ...(row.proposed_summary != null ? { summary: row.proposed_summary } : {}),
+          ...(row.proposed_description != null ? { description: row.proposed_description } : {}),
+          ...(row.proposed_start != null ? { start: { dateTime: row.proposed_start } } : {}),
+          ...(row.proposed_end != null ? { end: { dateTime: row.proposed_end } } : {}),
           extendedProperties: {
             private: encodeEventMetadata({
               schemaVersion: '1',
@@ -443,6 +562,27 @@ export async function applyProposedChange(
           .eq('id', row.source_id!);
       }
     } else if (row.change_type === 'delete') {
+      // Unlike update/move, nothing else in this branch already reads the
+      // event — added specifically for item 28, so a delete can be undone by
+      // recreating it (as a new event; the original event id doesn't survive
+      // a delete either way).
+      const { data: existingForDelete } = await calendar.events.get({
+        calendarId: BURNER_CALENDAR_ID,
+        eventId: row.target_event_id!,
+      });
+      const deletedMeta = decodeEventMetadata(existingForDelete.extendedProperties);
+      previousState = {
+        summary: existingForDelete.summary ?? null,
+        description: existingForDelete.description ?? null,
+        start: existingForDelete.start?.dateTime ?? null,
+        end: existingForDelete.end?.dateTime ?? null,
+        category: deletedMeta.type ?? null,
+        priority: deletedMeta.priority ?? null,
+        flexible: deletedMeta.flexible ?? null,
+        deadline: deletedMeta.deadline || null,
+        tags: decodeEventTags(deletedMeta.tags),
+      };
+
       await calendar.events.delete({
         calendarId: BURNER_CALENDAR_ID,
         eventId: row.target_event_id!,
@@ -464,6 +604,7 @@ export async function applyProposedChange(
       applied_at: now,
       error_message: null,
       target_event_id: resultingEventId ?? undefined,
+      previous_state: previousState,
     });
   } catch (err) {
     const message = err instanceof Error ? err.message : 'unknown error';
@@ -478,7 +619,7 @@ export async function applyProposedChange(
 
 export async function createProposedChange(
   input: ProposedChangeInput,
-  options: { skipAutoApply?: boolean } = {}
+  options: { skipAutoApply?: boolean; groupId?: string } = {}
 ): Promise<ProposedChangeRow> {
   validateProposalInput(input);
 
@@ -489,6 +630,17 @@ export async function createProposedChange(
       tags: normalizeTags(input.tags),
       color_tag: CATEGORY_COLORS[input.category],
       status: 'pending',
+      // previous_state is only ever written by applyProposedChange itself,
+      // from a real pre-write calendar read — never trust a client-supplied
+      // value (it isn't part of ProposedChangeInput, but an untyped JSON
+      // body could still carry the key). This override always wins since it
+      // comes after the spread above.
+      previous_state: null,
+      // Same reasoning — proposal_group_id is only ever set by
+      // createProposedChangesBatch below (options.groupId), never trusted
+      // from a client-supplied input field (ProposedChangeInput doesn't
+      // even declare one).
+      proposal_group_id: options.groupId ?? null,
     })
     .select('*')
     .single();
@@ -509,6 +661,148 @@ export async function createProposedChange(
   return row;
 }
 
+export interface BatchProposalResultEntry {
+  index: number;
+  outcome: 'proposed' | 'skipped-error';
+  proposal?: ProposedChangeRow;
+  reason?: string;
+}
+
+export interface BatchProposalSummary {
+  groupId: string;
+  proposalsRequested: number;
+  proposalsCreated: number;
+  skippedErrors: number;
+  results: BatchProposalResultEntry[];
+}
+
+// Phase 3.5 item 27 ("batch proposals") — the efficiency case this exists
+// for: a single NL sentence like "move everything after 3pm to tomorrow" or
+// "cancel my meetings except the manager one" naturally produces N
+// proposals, and reviewing/approving them one at a time is N round trips
+// through a chat loop. Every row shares one server-generated
+// proposal_group_id (never client-settable — see createProposedChange's own
+// override), so the whole batch can be approved/rejected as one unit
+// (approveProposalGroup/rejectProposalGroup below) instead.
+//
+// Each item goes through the exact same createProposedChange path
+// (validation, tag normalization, AUTO_APPLY_CATEGORIES) as a standalone
+// proposal — batching doesn't change per-item behavior, just gives the
+// resulting rows a shared handle. One item's failure (bad validation, or an
+// auto-applied item hitting a real conflict) doesn't abort the rest of the
+// batch, same per-item try/catch shape as every other fan-out engine in
+// this codebase (lib/bulkEdit.ts, lib/recurringEvents.ts, lib/habitPlacement.ts).
+export async function createProposedChangesBatch(
+  proposals: ProposedChangeInput[],
+  reason?: string
+): Promise<BatchProposalSummary> {
+  if (!Array.isArray(proposals) || proposals.length === 0) {
+    throw new ValidationError('"proposals" must be a non-empty array');
+  }
+  if (proposals.length > MAX_BATCH_SIZE) {
+    throw new ValidationError(`"proposals" must contain at most ${MAX_BATCH_SIZE} items`);
+  }
+
+  const groupId = randomUUID();
+  const summary: BatchProposalSummary = {
+    groupId,
+    proposalsRequested: proposals.length,
+    proposalsCreated: 0,
+    skippedErrors: 0,
+    results: [],
+  };
+
+  for (let i = 0; i < proposals.length; i++) {
+    const item = proposals[i];
+    try {
+      // Per-item reason wins if given; the batch-level reason is a shared
+      // fallback default, not an override — same precedence bulk-edit's own
+      // reason field has relative to per-match specifics.
+      const proposal = await createProposedChange(
+        { ...item, reason: item.reason ?? reason },
+        { groupId }
+      );
+      summary.proposalsCreated++;
+      summary.results.push({ index: i, outcome: 'proposed', proposal });
+    } catch (err) {
+      summary.skippedErrors++;
+      summary.results.push({
+        index: i,
+        outcome: 'skipped-error',
+        reason: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  return summary;
+}
+
+export interface GroupDecisionResultEntry {
+  id: string;
+  outcome: 'applied' | 'rejected' | 'failed' | 'skipped-already-decided';
+  proposal: ProposedChangeRow;
+}
+
+export interface GroupDecisionSummary {
+  groupId: string;
+  rowsInGroup: number;
+  results: GroupDecisionResultEntry[];
+}
+
+async function getProposalGroup(groupId: string): Promise<ProposedChangeRow[]> {
+  const { data, error } = await supabase
+    .from('proposed_changes')
+    .select('*')
+    .eq('proposal_group_id', groupId)
+    .order('created_at', { ascending: true });
+  if (error) throw new Error(`proposed_changes read failed: ${error.message}`);
+  const rows = (data ?? []) as ProposedChangeRow[];
+  if (rows.length === 0) throw new NotFoundError(`No proposal group with id "${groupId}"`);
+  return rows;
+}
+
+// Approves every still-open (pending/failed) row in the group; a row
+// that's already applied/rejected (e.g. it individually auto-applied via
+// AUTO_APPLY_CATEGORIES at creation time) is reported as
+// skipped-already-decided rather than erroring the whole group — same
+// "one item's state doesn't block the rest" principle as every other
+// batch/fan-out operation here.
+export async function approveProposalGroup(groupId: string): Promise<GroupDecisionSummary> {
+  const rows = await getProposalGroup(groupId);
+  const results: GroupDecisionResultEntry[] = [];
+
+  for (const row of rows) {
+    if (row.status !== 'pending' && row.status !== 'failed') {
+      results.push({ id: row.id, outcome: 'skipped-already-decided', proposal: row });
+      continue;
+    }
+    const applied = await applyProposedChange(row, 'user');
+    results.push({ id: row.id, outcome: applied.status === 'applied' ? 'applied' : 'failed', proposal: applied });
+  }
+
+  return { groupId, rowsInGroup: rows.length, results };
+}
+
+export async function rejectProposalGroup(groupId: string): Promise<GroupDecisionSummary> {
+  const rows = await getProposalGroup(groupId);
+  const results: GroupDecisionResultEntry[] = [];
+
+  for (const row of rows) {
+    if (row.status !== 'pending' && row.status !== 'failed') {
+      results.push({ id: row.id, outcome: 'skipped-already-decided', proposal: row });
+      continue;
+    }
+    const rejected = await updateProposedChange(row.id, {
+      status: 'rejected',
+      decided_by: 'user',
+      decided_at: new Date().toISOString(),
+    });
+    results.push({ id: row.id, outcome: 'rejected', proposal: rejected });
+  }
+
+  return { groupId, rowsInGroup: rows.length, results };
+}
+
 export async function approveProposedChange(id: string): Promise<ProposedChangeRow> {
   const row = await getProposedChange(id);
   if (row.status !== 'pending' && row.status !== 'failed') {
@@ -527,6 +821,112 @@ export async function rejectProposedChange(id: string): Promise<ProposedChangeRo
     decided_by: 'user',
     decided_at: new Date().toISOString(),
   });
+}
+
+// Phase 3.5 item 28 ("undo") — turns an already-`applied` row into the
+// opposite ProposedChangeInput, using the `previous_state` snapshot captured
+// at apply time. Never mutates the calendar itself: like attemptBump above,
+// it creates a brand-new compensating proposal (skipAutoApply: true, so it
+// always lands `pending` regardless of AUTO_APPLY_CATEGORIES) rather than
+// applying immediately — "undo" is exactly the kind of decision that
+// shouldn't silently cascade. Approving that new proposal is a second,
+// ordinary call, same two-step shape as approving any other proposal.
+function buildRevertInput(row: ProposedChangeRow): ProposedChangeInput {
+  const reasonSuffix = `revert of proposal ${row.id}`;
+
+  switch (row.change_type) {
+    case 'create': {
+      // The task-list-intake shape (category 'task', no proposed_start/end)
+      // never touches the calendar, so target_event_id stays null even after
+      // applying — nothing here for a revert to undo.
+      if (!row.target_event_id) {
+        throw new ConflictError(
+          'This proposal never wrote to the calendar (task-list intake) — nothing to revert'
+        );
+      }
+      return {
+        change_type: 'delete',
+        category: row.category,
+        source_system: 'ai-engine',
+        target_event_id: row.target_event_id,
+        reason: `Undo create — ${reasonSuffix}`,
+      };
+    }
+    case 'move': {
+      const ps = row.previous_state;
+      if (!ps?.start || !ps?.end) {
+        throw new ConflictError('No previous position was captured for this move — nothing to revert to');
+      }
+      return {
+        change_type: 'move',
+        category: row.category,
+        source_system: 'ai-engine',
+        target_event_id: row.target_event_id!,
+        proposed_start: ps.start,
+        proposed_end: ps.end,
+        reason: `Undo move — ${reasonSuffix}`,
+      };
+    }
+    case 'update': {
+      const ps = row.previous_state;
+      if (!ps) {
+        throw new ConflictError('No previous state was captured for this update — nothing to revert to');
+      }
+      return {
+        change_type: 'update',
+        category: ps.category ?? row.category,
+        source_system: 'ai-engine',
+        target_event_id: row.target_event_id!,
+        proposed_summary: ps.summary ?? undefined,
+        // '', not undefined, when there was genuinely no description before
+        // — undefined now means "don't touch" (see the !== undefined check
+        // in applyProposedChange's update branch above), so a real full
+        // restore has to explicitly send the empty value, not omit it.
+        proposed_description: ps.description ?? '',
+        proposed_start: ps.start ?? undefined,
+        proposed_end: ps.end ?? undefined,
+        priority: ps.priority ?? undefined,
+        deadline: ps.deadline ?? undefined,
+        tags: ps.tags,
+        flexible: ps.flexible ?? undefined,
+        reason: `Undo update — ${reasonSuffix}`,
+      };
+    }
+    case 'delete': {
+      const ps = row.previous_state;
+      if (!ps?.start || !ps?.end) {
+        throw new ConflictError('No previous state was captured for this delete — nothing to restore');
+      }
+      // The original event id is gone — this recreates it as a new event,
+      // same "revert = compensating action, not time travel" tradeoff as the
+      // rest of this system.
+      return {
+        change_type: 'create',
+        category: ps.category ?? row.category,
+        source_system: 'ai-engine',
+        proposed_start: ps.start,
+        proposed_end: ps.end,
+        proposed_summary: ps.summary ?? '(untitled)',
+        proposed_description: ps.description ?? undefined,
+        priority: ps.priority ?? undefined,
+        deadline: ps.deadline ?? undefined,
+        tags: ps.tags,
+        flexible: ps.flexible ?? undefined,
+        reason: `Undo delete (restored as a new event) — ${reasonSuffix}`,
+      };
+    }
+  }
+}
+
+export async function revertProposedChange(id: string): Promise<ProposedChangeRow> {
+  const row = await getProposedChange(id);
+  if (row.status !== 'applied') {
+    throw new ConflictError(
+      `Cannot revert a proposed change with status "${row.status}" — only "applied" changes can be reverted`
+    );
+  }
+  const revertInput = buildRevertInput(row);
+  return createProposedChange(revertInput, { skipAutoApply: true });
 }
 
 // Sets priority/tags on a still-open proposal — the review-time step
@@ -581,9 +981,13 @@ export function describeProposalOutcome(row: ProposedChangeRow): string {
   }
 }
 
-export async function listProposedChanges(status?: ProposalStatus): Promise<ProposedChangeRow[]> {
+export async function listProposedChanges(
+  status?: ProposalStatus,
+  groupId?: string
+): Promise<ProposedChangeRow[]> {
   let query = supabase.from('proposed_changes').select('*').order('created_at', { ascending: false });
   if (status) query = query.eq('status', status);
+  if (groupId) query = query.eq('proposal_group_id', groupId);
   const { data, error } = await query;
   if (error) throw new Error(`proposed_changes read failed: ${error.message}`);
   return data as ProposedChangeRow[];

@@ -155,4 +155,152 @@ describe('generateWeeklyOccurrences', () => {
       expect(start.hour).toBe(firstOccurrence.hour);
     }
   });
+
+  it('weekdays: generates one occurrence per listed weekday each active week, same time-of-day ("MWF gym")', () => {
+    const { occurrences } = generateWeeklyOccurrences(
+      '2026-08-03T07:00:00-04:00', // a Monday, 7am EDT
+      '2026-08-03T08:00:00-04:00',
+      1,
+      config,
+      6,
+      undefined,
+      [1, 3, 5] // Mon, Wed, Fri
+    );
+
+    expect(occurrences).toHaveLength(6);
+    const starts = occurrences.map((o) => DateTime.fromISO(o.start, { zone: config.homeTimezone }));
+    expect(starts.map((s) => s.weekday)).toEqual([1, 3, 5, 1, 3, 5]);
+    for (const s of starts) {
+      expect(s.hour).toBe(7);
+      expect(s.minute).toBe(0);
+    }
+    // Chronologically ascending, and the two weeks' worth land 7 days apart
+    // for the same weekday (Monday week 1 -> Monday week 2).
+    expect(starts[3].toISODate()).toBe(starts[0].plus({ weeks: 1 }).toISODate());
+  });
+
+  it('weekdays: interval_weeks skips whole weeks, not individual weekdays ("every other week, MWF")', () => {
+    const { occurrences } = generateWeeklyOccurrences(
+      '2026-08-03T07:00:00-04:00', // a Monday
+      '2026-08-03T08:00:00-04:00',
+      2,
+      config,
+      6,
+      undefined,
+      [1, 3, 5]
+    );
+
+    const dates = occurrences.map((o) => DateTime.fromISO(o.start, { zone: config.homeTimezone }).toISODate());
+    // Week of 8/3 (Mon/Wed/Fri), then week of 8/17 (skipping 8/10's week) —
+    // 14 days later, not 7.
+    expect(dates).toEqual(['2026-08-03', '2026-08-05', '2026-08-07', '2026-08-17', '2026-08-19', '2026-08-21']);
+  });
+
+  it('weekdays: a weekday before first_start\'s own weekday only starts appearing from the next active week', () => {
+    // first_start is Wednesday — Monday is in the list but is *before* the
+    // series' own start within that first calendar week, so it shouldn't
+    // appear until the following week.
+    const { occurrences } = generateWeeklyOccurrences(
+      '2026-08-05T07:00:00-04:00', // a Wednesday
+      '2026-08-05T08:00:00-04:00',
+      1,
+      config,
+      3,
+      undefined,
+      [1, 3] // Mon, Wed
+    );
+
+    const dates = occurrences.map((o) => DateTime.fromISO(o.start, { zone: config.homeTimezone }).toISODate());
+    // Week 1: only Wednesday (Monday would've been 8/3, before first_start).
+    // Week 2: both Monday (8/10) and Wednesday (8/12).
+    expect(dates).toEqual(['2026-08-05', '2026-08-10', '2026-08-12']);
+  });
+
+  it('weekdays defaulting to [first_start\'s own weekday] reproduces the original single-weekday behavior exactly', () => {
+    const withoutWeekdays = generateWeeklyOccurrences(
+      '2026-08-06T19:00:00-04:00',
+      '2026-08-06T20:00:00-04:00',
+      1,
+      config,
+      4
+    );
+    const withExplicitWeekday = generateWeeklyOccurrences(
+      '2026-08-06T19:00:00-04:00',
+      '2026-08-06T20:00:00-04:00',
+      1,
+      config,
+      4,
+      undefined,
+      [4] // Thursday, same as first_start's own weekday
+    );
+    expect(withExplicitWeekday.occurrences).toEqual(withoutWeekdays.occurrences);
+  });
+
+  it('skip_dates: a skipped occurrence does not count toward `count` — generation continues to find a real one', () => {
+    const { occurrences } = generateWeeklyOccurrences(
+      '2026-08-06T19:00:00-04:00', // Thursdays: 8/6, 8/13, 8/20, 8/27, 9/3...
+      '2026-08-06T20:00:00-04:00',
+      1,
+      config,
+      3,
+      undefined,
+      undefined,
+      ['2026-08-13'] // skip the 2nd occurrence
+    );
+
+    expect(occurrences).toHaveLength(3);
+    const dates = occurrences.map((o) => DateTime.fromISO(o.start, { zone: config.homeTimezone }).toISODate());
+    expect(dates).toEqual(['2026-08-06', '2026-08-20', '2026-08-27']);
+  });
+
+  it('skip_dates combined with weekdays: skips just the matching date, keeps the rest of that week', () => {
+    const { occurrences } = generateWeeklyOccurrences(
+      '2026-08-03T07:00:00-04:00', // Monday
+      '2026-08-03T08:00:00-04:00',
+      1,
+      config,
+      4,
+      undefined,
+      [1, 3, 5], // Mon/Wed/Fri
+      ['2026-08-05'] // skip that Wednesday
+    );
+
+    const dates = occurrences.map((o) => DateTime.fromISO(o.start, { zone: config.homeTimezone }).toISODate());
+    expect(dates).toEqual(['2026-08-03', '2026-08-07', '2026-08-10', '2026-08-12']);
+  });
+
+  it('skip_dates: throws on a malformed entry', () => {
+    expect(() =>
+      generateWeeklyOccurrences(
+        '2026-08-06T19:00:00-04:00',
+        '2026-08-06T20:00:00-04:00',
+        1,
+        config,
+        2,
+        undefined,
+        undefined,
+        ['not-a-date']
+      )
+    ).toThrow(/skip_dates/);
+  });
+
+  it('sets truncated:true when skip_dates would otherwise cause runaway scanning toward an unreachable count', () => {
+    const { occurrences, truncated } = generateWeeklyOccurrences(
+      '2026-08-06T19:00:00-04:00',
+      '2026-08-06T20:00:00-04:00',
+      1,
+      config,
+      50, // asking for 50 occurrences...
+      undefined,
+      undefined,
+      Array.from({ length: 260 }, (_, i) =>
+        DateTime.fromISO('2026-08-06T19:00:00-04:00', { zone: config.homeTimezone })
+          .plus({ weeks: i })
+          .toISODate()!
+      ) // ...but every candidate up to the scan cap is skipped
+    );
+
+    expect(truncated).toBe(true);
+    expect(occurrences).toHaveLength(0);
+  });
 });

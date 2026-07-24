@@ -11,14 +11,32 @@ export interface RecurringOccurrence {
   end: string;
 }
 
-// Weekly (or every-N-weeks) recurrence, anchored to firstStart's own weekday
-// and time-of-day. Interval math happens in HOME_TIMEZONE via Luxon's
-// zone-aware plus(), not raw millisecond arithmetic, so "7pm every Thursday"
-// stays 7pm local across a DST transition between occurrences — same
-// DST-correctness requirement lib/workingHours.ts already meets for working
-// hours. `firstStart`/`firstEnd` are parsed with their own embedded
-// offset/zone (same as every other proposed_start/proposed_end in this
-// backend) and represented in HOME_TIMEZONE for that arithmetic.
+// Weekly (or every-N-weeks) recurrence, anchored to firstStart's own
+// time-of-day (and, absent `weekdays`, its own weekday too). Interval math
+// happens in HOME_TIMEZONE via Luxon's zone-aware plus(), not raw
+// millisecond arithmetic, so "7pm every Thursday" stays 7pm local across a
+// DST transition between occurrences — same DST-correctness requirement
+// lib/workingHours.ts already meets for working hours. `firstStart`/
+// `firstEnd` are parsed with their own embedded offset/zone (same as every
+// other proposed_start/proposed_end in this backend) and represented in
+// HOME_TIMEZONE for that arithmetic.
+//
+// `weekdays` (Phase 3.5 item 32, 1=Monday..7=Sunday, same convention as
+// lib/schedulingRules.ts's SchedulingRuleRow.weekdays and WORKING_DAYS) —
+// omitted/empty defaults to `[firstStart's own weekday]`, which reduces to
+// exactly the original single-weekday behavior (every existing caller/test
+// is unaffected). Given explicitly (e.g. [1,3,5] for "MWF"), every listed
+// weekday gets an occurrence each active week, all at firstStart's own
+// time-of-day; `intervalWeeks` skips whole weeks, not individual weekdays —
+// "every other week, MWF" means 3 occurrences in each active week, none in
+// the week between. `count` counts real (non-skipped) occurrences across
+// every weekday combined, not per-weekday.
+//
+// `skipDates` (item 32, "skip the last week of the month") — an occurrence
+// whose local calendar date matches an entry is dropped and does NOT count
+// toward `count`; generation keeps going to find enough *real* occurrences,
+// bounded by `MAX_OCCURRENCES` counted against candidates *scanned* (not
+// just kept), so an absurd skip list can't spin this into an infinite loop.
 //
 // Kept in its own file with no side-effecting imports (mirrors
 // lib/habitSpacing.ts vs. lib/habitPlacement.ts) so it's unit-testable
@@ -29,7 +47,9 @@ export function generateWeeklyOccurrences(
   intervalWeeks: number,
   config: SchedulingConfig,
   count?: number,
-  until?: string
+  until?: string,
+  weekdays?: number[],
+  skipDates?: string[]
 ): { occurrences: RecurringOccurrence[]; truncated: boolean } {
   const start = DateTime.fromISO(firstStart, { zone: config.homeTimezone });
   const end = DateTime.fromISO(firstEnd, { zone: config.homeTimezone });
@@ -49,23 +69,48 @@ export function generateWeeklyOccurrences(
     }
   }
 
-  const occurrences: RecurringOccurrence[] = [];
-  let current = start;
-  let truncated = false;
-
-  while (true) {
-    if (count !== undefined && occurrences.length >= count) break;
-    if (untilDT && current > untilDT) break;
-    if (occurrences.length >= MAX_OCCURRENCES) {
-      truncated = true;
-      break;
+  for (const d of skipDates ?? []) {
+    if (!DateTime.fromISO(d).isValid) {
+      throw new Error(`"skip_dates" entry "${d}" is not a valid ISO date`);
     }
+  }
+  const skipSet = new Set(skipDates ?? []);
 
-    occurrences.push({
-      start: current.toISO()!,
-      end: current.plus({ milliseconds: durationMs }).toISO()!,
-    });
-    current = current.plus({ weeks: intervalWeeks });
+  const activeWeekdays =
+    weekdays && weekdays.length > 0 ? [...new Set(weekdays)].sort((a, b) => a - b) : [start.weekday];
+
+  const occurrences: RecurringOccurrence[] = [];
+  let truncated = false;
+  let candidatesScanned = 0;
+  let weekStart = start.startOf('week');
+
+  outer: while (true) {
+    for (const weekday of activeWeekdays) {
+      if (count !== undefined && occurrences.length >= count) break outer;
+      if (candidatesScanned >= MAX_OCCURRENCES) {
+        truncated = true;
+        break outer;
+      }
+
+      const candidate = weekStart.plus({ days: weekday - 1 }).set({
+        hour: start.hour,
+        minute: start.minute,
+        second: start.second,
+        millisecond: start.millisecond,
+      });
+
+      if (candidate.toMillis() < start.toMillis()) continue; // before the series' own start
+      if (untilDT && candidate > untilDT) break outer;
+
+      candidatesScanned++;
+      if (skipSet.has(candidate.toISODate()!)) continue; // doesn't count toward `count`
+
+      occurrences.push({
+        start: candidate.toISO()!,
+        end: candidate.plus({ milliseconds: durationMs }).toISO()!,
+      });
+    }
+    weekStart = weekStart.plus({ weeks: intervalWeeks });
   }
 
   return { occurrences, truncated };

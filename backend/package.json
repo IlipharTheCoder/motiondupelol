@@ -10,6 +10,7 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.114.0",
     "@supabase/supabase-js": "^2.110.8",
     "googleapis": "^173.0.0",
     "luxon": "^3.7.2",

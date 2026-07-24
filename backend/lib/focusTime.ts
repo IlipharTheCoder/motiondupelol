@@ -179,7 +179,11 @@ export async function planFocusTime(now: Date = new Date()): Promise<FocusTimePl
     return result;
   }
 
-  const { slots } = await findFreeSlots(searchStart, weekEnd, { minDurationMinutes: MIN_BLOCK_MINUTES, config });
+  const { slots } = await findFreeSlots(searchStart, weekEnd, {
+    minDurationMinutes: MIN_BLOCK_MINUTES,
+    config,
+    category: 'focusTime',
+  });
 
   // Pending proposals aren't real calendar events yet, so findFreeSlots
   // still sees their time as open — carve it back out so re-running this
@@ -327,7 +331,7 @@ export async function suggestFocusTimeOptions(
   }
 
   const [{ slots }, pendingProposals] = await Promise.all([
-    findFreeSlots(searchStart, rangeEnd, { minDurationMinutes: durationMinutes, config }),
+    findFreeSlots(searchStart, rangeEnd, { minDurationMinutes: durationMinutes, config, category: 'focusTime' }),
     fetchPendingFocusProposals(rangeStart, rangeEnd),
   ]);
 

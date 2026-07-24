@@ -16,6 +16,8 @@ export interface RecurringSeriesInput {
   interval_weeks?: number;
   count?: number;
   until?: string;
+  weekdays?: number[];
+  skip_dates?: string[];
   tags?: string[];
   bump_if_movable?: boolean;
   reason?: string;
@@ -66,7 +68,9 @@ export async function planRecurringSeries(
     intervalWeeks,
     config,
     input.count,
-    input.until
+    input.until,
+    input.weekdays,
+    input.skip_dates
   );
 
   const tags = normalizeTags([seriesTag, ...(input.tags ?? [])]);

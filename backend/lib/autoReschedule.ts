@@ -165,7 +165,12 @@ export async function findAndProposeReschedules(
       continue;
     }
 
-    const { slots } = await findFreeSlots(searchStart, rangeEnd, { minDurationMinutes: durationMinutes, config });
+    const { slots } = await findFreeSlots(searchStart, rangeEnd, {
+      minDurationMinutes: durationMinutes,
+      config,
+      category: mover.category,
+      tags: mover.tags,
+    });
     if (slots.length === 0) {
       noSlotAvailable++;
       continue;

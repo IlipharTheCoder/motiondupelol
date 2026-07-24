@@ -212,7 +212,8 @@ export async function scheduleTaskToNewEvent(
   taskId: string,
   proposedStart: string,
   proposedEnd: string,
-  bumpIfMovable = false
+  bumpIfMovable = false,
+  ignoreSchedulingRules = false
 ): Promise<CreateTaskEventResult> {
   const task = await getTask(taskId);
   assertUnscheduled(task);
@@ -238,6 +239,7 @@ export async function scheduleTaskToNewEvent(
     proposed_start: proposedStart,
     proposed_end: proposedEnd,
     bump_if_movable: bumpIfMovable,
+    ignore_scheduling_rules: ignoreSchedulingRules,
     reason: `Schedule task "${task.title}" onto the calendar`,
   });
 

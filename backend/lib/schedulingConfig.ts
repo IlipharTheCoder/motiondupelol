@@ -17,7 +17,7 @@ const DEFAULT_WORKING_HOURS_START: TimeOfDay = { hour: 10, minute: 0 };
 const DEFAULT_WORKING_HOURS_END: TimeOfDay = { hour: 18, minute: 0 };
 const DEFAULT_WORKING_DAYS = [1, 2, 3, 4, 5];
 
-function parseTimeOfDay(raw: string, envVarName: string): TimeOfDay {
+export function parseTimeOfDay(raw: string, envVarName: string): TimeOfDay {
   const match = /^([0-9]{1,2}):([0-9]{2})$/.exec(raw.trim());
   if (!match) {
     throw new Error(`${envVarName}="${raw}" is not a valid HH:mm time string`);

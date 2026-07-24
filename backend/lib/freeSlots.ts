@@ -2,11 +2,19 @@ import { getSchedulingConfig, type SchedulingConfig } from './schedulingConfig';
 import { generateWorkingWindows } from './workingHours';
 import { fetchBusyIntervals, type BusyInterval } from './busyIntervals';
 import { mergeIntervals, subtractIntervals, filterByMinDuration, intervalsOverlap, type Interval } from './intervals';
+import { fetchApplicableSchedulingRules } from './schedulingRulesQuery';
+import type { BurnerEventType } from './eventMetadata';
 
 export interface FindFreeSlotsOptions {
   minDurationMinutes?: number;
   paddingMinutes?: number;
   config?: SchedulingConfig;
+  // Phase 3.5 item 30 — what's being placed, so standing scheduling_rules
+  // scoped to a category/tag can narrow the search. Omitting both still
+  // applies any *global* (no category/tag) active rule — only
+  // category/tag-scoped rules need these to match.
+  category?: BurnerEventType;
+  tags?: string[];
 }
 
 export interface FindFreeSlotsResult {
@@ -25,7 +33,8 @@ export async function findFreeSlots(
   }
 
   const config = options.config ?? getSchedulingConfig();
-  const windows = generateWorkingWindows(rangeStart, rangeEnd, config);
+  const rules = await fetchApplicableSchedulingRules(options.category, options.tags ?? []);
+  const windows = generateWorkingWindows(rangeStart, rangeEnd, config, rules);
 
   if (windows.length === 0) {
     return { slots: [], rangeStart: rangeStart.toISOString(), rangeEnd: rangeEnd.toISOString() };

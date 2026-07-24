@@ -1,5 +1,7 @@
 import { isAuthorized } from '@/lib/auth';
 import { findFreeSlots } from '@/lib/freeSlots';
+import { BURNER_EVENT_TYPES, type BurnerEventType } from '@/lib/eventMetadata';
+import { normalizeTags } from '@/lib/normalizeTags';
 
 function parseOptionalNonNegativeInt(raw: string | null, name: string): number | undefined {
   if (raw === null) return undefined;
@@ -41,8 +43,20 @@ export async function GET(request: Request) {
     return Response.json({ error: (error as Error).message }, { status: 400 });
   }
 
+  // Optional (item 30) — lets this diagnostic/on-demand endpoint preview
+  // the same scheduling_rules-narrowed result a real planner would get for
+  // this category/tags. Omitting both still applies any global (no
+  // category/tag) active rule.
+  const categoryParam = searchParams.get('category');
+  if (categoryParam !== null && !BURNER_EVENT_TYPES.includes(categoryParam as BurnerEventType)) {
+    return Response.json({ error: `"category" must be one of ${BURNER_EVENT_TYPES.join(', ')}` }, { status: 400 });
+  }
+  const category = (categoryParam as BurnerEventType | null) ?? undefined;
+  const tagsParam = searchParams.get('tags');
+  const tags = tagsParam ? normalizeTags(tagsParam.split(',')) : undefined;
+
   try {
-    const result = await findFreeSlots(rangeStart, rangeEnd, { minDurationMinutes, paddingMinutes });
+    const result = await findFreeSlots(rangeStart, rangeEnd, { minDurationMinutes, paddingMinutes, category, tags });
 
     return Response.json({
       rangeStart: result.rangeStart,

@@ -276,6 +276,8 @@ export async function planHabitPlacement(now: Date = new Date()): Promise<HabitP
       const { slots } = await findFreeSlots(searchStart, ctx.periodEnd, {
         minDurationMinutes: occurrenceDurationMinutes,
         config,
+        category: 'habit',
+        tags: ctx.habit.tags ?? [],
       });
 
       let fitting = filterByMinDuration(subtractIntervals(slots, claimedIntervals), occurrenceDurationMinutes);

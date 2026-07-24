@@ -26,6 +26,9 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
   if (body.bumpIfMovable !== undefined && typeof body.bumpIfMovable !== 'boolean') {
     return Response.json({ error: '"bumpIfMovable" must be a boolean' }, { status: 400 });
   }
+  if (body.ignoreSchedulingRules !== undefined && typeof body.ignoreSchedulingRules !== 'boolean') {
+    return Response.json({ error: '"ignoreSchedulingRules" must be a boolean' }, { status: 400 });
+  }
 
   try {
     if (hasEventId) {
@@ -44,7 +47,8 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
       id,
       body.proposed_start,
       body.proposed_end,
-      body.bumpIfMovable === true
+      body.bumpIfMovable === true,
+      body.ignoreSchedulingRules === true
     );
     return Response.json(result);
   } catch (error) {

@@ -19,9 +19,10 @@ export async function GET(request: Request) {
   if (status && !VALID_STATUSES.includes(status as ProposalStatus)) {
     return Response.json({ error: `"status" must be one of ${VALID_STATUSES.join(', ')}` }, { status: 400 });
   }
+  const groupId = searchParams.get('group_id') ?? undefined;
 
   try {
-    const rows = await listProposedChanges(status as ProposalStatus | undefined);
+    const rows = await listProposedChanges(status as ProposalStatus | undefined, groupId);
     return Response.json(rows);
   } catch (error) {
     return Response.json({ error: (error as Error).message }, { status: 500 });

@@ -1,6 +1,7 @@
-import { supabase } from '@/lib/supabase';
 import { isAuthorized } from '@/lib/auth';
-import { CAPABILITY_REQUEST_STATUSES, type CapabilityRequestStatus } from '@/lib/capabilityRequests';
+import { ValidationError } from '@/lib/proposedChanges';
+import { createCapabilityRequest, listCapabilityRequests } from '@/lib/capabilityRequestsWrite';
+import type { CapabilityRequestStatus } from '@/lib/capabilityRequests';
 
 export async function GET(request: Request) {
   if (!isAuthorized(request)) {
@@ -9,22 +10,16 @@ export async function GET(request: Request) {
 
   const { searchParams } = new URL(request.url);
   const status = searchParams.get('status');
-  if (status && !CAPABILITY_REQUEST_STATUSES.includes(status as CapabilityRequestStatus)) {
-    return Response.json(
-      { error: `"status" must be one of ${CAPABILITY_REQUEST_STATUSES.join(', ')}` },
-      { status: 400 }
-    );
+
+  try {
+    const rows = await listCapabilityRequests((status as CapabilityRequestStatus) ?? undefined);
+    return Response.json(rows);
+  } catch (error) {
+    if (error instanceof ValidationError) {
+      return Response.json({ error: error.message }, { status: 400 });
+    }
+    return Response.json({ error: (error as Error).message }, { status: 500 });
   }
-
-  let query = supabase.from('capability_requests').select('*').order('created_at', { ascending: false });
-  if (status) query = query.eq('status', status);
-
-  const { data, error } = await query;
-  if (error) {
-    return Response.json({ error: error.message }, { status: 500 });
-  }
-
-  return Response.json(data);
 }
 
 export async function POST(request: Request) {
@@ -37,28 +32,13 @@ export async function POST(request: Request) {
     return Response.json({ error: 'Request body must be JSON' }, { status: 400 });
   }
 
-  const requestedCapability = typeof body.requested_capability === 'string' ? body.requested_capability.trim() : '';
-  if (!requestedCapability) {
-    return Response.json({ error: 'requested_capability is required' }, { status: 400 });
+  try {
+    const row = await createCapabilityRequest(body);
+    return Response.json(row);
+  } catch (error) {
+    if (error instanceof ValidationError) {
+      return Response.json({ error: error.message }, { status: 400 });
+    }
+    return Response.json({ error: (error as Error).message }, { status: 500 });
   }
-
-  const examplePhrase = typeof body.example_phrase === 'string' ? body.example_phrase : null;
-  const context = typeof body.context === 'string' ? body.context : null;
-
-  const { data, error } = await supabase
-    .from('capability_requests')
-    .insert({
-      requested_capability: requestedCapability,
-      example_phrase: examplePhrase,
-      context,
-      status: 'open',
-    })
-    .select('*')
-    .single();
-
-  if (error) {
-    return Response.json({ error: error.message }, { status: 500 });
-  }
-
-  return Response.json(data);
 }

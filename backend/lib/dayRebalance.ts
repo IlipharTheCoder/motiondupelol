@@ -131,7 +131,12 @@ export async function rebalanceWorkload(
       continue;
     }
 
-    const { slots } = await findFreeSlots(searchFloor, searchEnd, { minDurationMinutes: durationMinutes, config });
+    const { slots } = await findFreeSlots(searchFloor, searchEnd, {
+      minDurationMinutes: durationMinutes,
+      config,
+      category: candidate.category,
+      tags: candidate.tags,
+    });
     const fitting = filterByMinDuration(subtractIntervals(slots, claimedIntervals), durationMinutes);
     if (fitting.length === 0) {
       result.skippedNoSlot++;

@@ -143,6 +143,8 @@ export async function planTaskPlacement(
       const { slots } = await findFreeSlots(searchStart, windowEnd, {
         minDurationMinutes: durationMinutes,
         config,
+        category: 'task',
+        tags: task.tags ?? [],
       });
 
       if (slots.length === 0) {

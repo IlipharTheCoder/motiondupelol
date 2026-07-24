@@ -194,6 +194,21 @@ alter table proposed_changes add column bump_if_movable boolean not null default
 notify pgrst, 'reload schema';
 ```
 
+**`previous_state` (added 2026-07-24, Phase 3.5 item 28, "undo"):** `jsonb`, nullable — a snapshot of the calendar event's revertible fields (`summary`/`description`/`start`/`end`/`category`/`priority`/`flexible`/`deadline`/`tags`) taken by `applyProposedChange` (`lib/proposedChanges.ts`) immediately before its write, and left `null` for anything that never touched the calendar (a still-`pending`/`rejected`/`failed` row, or an applied task-list-intake `create`). Never client-settable — `createProposedChange` always overwrites it to `null` on insert regardless of what a request body contains, the same defensive pattern already used for `color_tag`/`status`. What gets captured is scoped to what that `change_type` actually overwrites: a `move` only ever changes `start`/`end`, so its snapshot leaves every other field `null`; `update`/`delete` capture the full shape since any of those fields could have changed; `create` leaves it `null` entirely (nothing existed before — reverting a create just deletes the resulting event). The `update` and `delete` branches were already reading the existing event before their write (Google's `patch` requires resending the full `extendedProperties` map, and this is what item 28's own notes flagged as "capturing what you're currently discarding") — only the `move` and `delete` branches needed a new read added, `update` was free. See `POST /api/proposed-changes/{id}/revert` in `backend-api-reference.md`.
+
+```sql
+alter table proposed_changes add column previous_state jsonb;
+notify pgrst, 'reload schema';
+```
+
+**`proposal_group_id` (added 2026-07-24, Phase 3.5 item 27, "batch proposals"):** `uuid`, nullable — shared by every row created in one `POST /api/proposed-changes/batch` call, `null` for anything created the ordinary single-proposal way. Never client-settable, same defensive override pattern as `previous_state` (the batch endpoint generates it server-side via `crypto.randomUUID()`). Exists so an NL-loop-generated "move everything after 3pm to tomorrow" (N proposals from one sentence) can be approved/reviewed as one unit (`POST /api/proposed-changes/batch/{group_id}/approve|reject`, `GET /api/proposed-changes?group_id=...`) instead of N separate round trips — see `backend-api-reference.md`.
+
+```sql
+alter table proposed_changes add column proposal_group_id uuid;
+create index proposed_changes_group_id_idx on proposed_changes (proposal_group_id);
+notify pgrst, 'reload schema';
+```
+
 **`update` + `source_id` = "link this task to an already-existing event" (AI Tasks Part 1, `architecture-plan.md` section 4d).** A bare `source_id` (no other field) now satisfies `update`'s "needs something to change" validation — this is the one shape where `source_id`'s presence flips the normal precedence: for every other `update`, the *existing* event's `sourceSystem`/`sourceId` metadata wins (a plain field edit shouldn't silently overwrite an event's origin); here, the *proposal's* `source_id` wins instead, and on success the matching `tasks` row (if `source_id` is UUID-shaped — Todoist's own intake `create` shape reuses `source_id` for an external Todoist id, not a `tasks.id`, so this is guarded rather than assumed) gets `status: 'scheduled'` + `scheduled_event_id` set. See `POST /api/tasks/{id}/schedule` in `backend-api-reference.md`.
 
 `category` reuses `BurnerEventType` and `source_system` reuses `SourceSystem` (both from `lib/eventMetadata.ts`) rather than inventing parallel enums.
@@ -383,5 +398,118 @@ notify pgrst, 'reload schema';
 ```
 
 **Access / No RLS:** same reasoning as `inbox_items`/`event_metadata`.
+
+**Access / No RLS:** same reasoning as `inbox_items`/`event_metadata`.
+
+---
+
+## `scheduling_rules`
+
+Phase 3.5 item 30 (`backend-build-order.md`) — standing, runtime-editable constraints on *when* something may be scheduled (e.g. "don't schedule anything before 9am on weekdays"), consumed by `findFreeSlots` (`lib/freeSlots.ts`) so every planner that searches for an opening — tasks, habits, focus time, buffers-adjacent auto-reschedule/rebalance, and the bump-relocation search — respects them automatically, in one place, rather than each guessing a bound. Populated directly via `POST /api/scheduling-rules` — a rule declaration is a standing policy, not a calendar write, same reasoning as `habits`/`capability_requests`.
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | `uuid` | Primary key, default-generated |
+| `name` | `text` | Optional human-readable label (e.g. `"No meetings before 9am"`) — surfaced in a write-time rejection message so the reason is legible, not just a raw id |
+| `category` | `text` | One of `BurnerEventType` (`lib/eventMetadata.ts`), or `null` for a rule scoped by `tag` instead, or `null`+`tag` also `null` for a global rule. **Mutually exclusive with `tag`** — a rule matches on category, or tag, or neither, never both on the same row (confirmed design choice — keeps the match condition to one dimension per rule; a "category AND tag" need is two separate rules, each still narrowing via intersection) |
+| `tag` | `text` | See `category` above. Not `normalizeTags()`-treated at read time (matching happens against an event's own already-normalized tags — see `lib/schedulingRules.ts`'s `fetchApplicableSchedulingRules`), but normalized at write time same as any other tag field |
+| `starts_after` | `text` | `"HH:mm"`, local to `HOME_TIMEZONE` — the earliest time-of-day this rule allows a match to *start*. Same field semantics/naming as `POST /api/calendar/bulk-edit`'s `starts_after` (item 29) — reused deliberately for consistency, not independently invented. At least one of `starts_after`/`starts_before` is required (`scheduling_rules_needs_a_time_bound`) and, if both are given, `starts_before` must be later (`scheduling_rules_before_after_order`) — validated in application code on `POST` (which has the full picture), with both as DB-level backstops for `PATCH` (which doesn't re-read the row first, same "can't fully validate without a re-read, constraint is the backstop" precedent as `habits_interval_requires_days`) |
+| `starts_before` | `text` | `"HH:mm"`, local to `HOME_TIMEZONE`, exclusive — the latest time-of-day this rule allows a match to start. See `starts_after` |
+| `weekdays` | `smallint[]` | Luxon weekday numbers, `1`=Monday..`7`=Sunday. `null`/empty means the rule applies every day; a non-empty list scopes the rule to just those weekdays (e.g. `[1,2,3,4,5]` for "on weekdays") |
+| `active` | `boolean` | `not null default true` — the pause mechanism, same as `habits.status`; no delete route |
+| `created_at` | `timestamptz` | Default `now()` |
+| `updated_at` | `timestamptz` | Default `now()` |
+
+**Combination semantics (confirmed design choice — Q2 of the pre-build design discussion):** every active rule that matches an event's category/tag scope *and* applies to the day in question **narrows the allowed window further** (an AND-intersection of every matching rule, never a widening, never a single "most-specific-wins" override) — see `lib/schedulingRules.ts`'s `narrowDayWindowByRules`. A global rule (no `category`/`tag`) therefore always holds as a floor no more specific rule can silently bypass.
+
+**Two independent consumers of the same rule set, not one:**
+1. **Search-side (`findFreeSlots`):** `generateWorkingWindows` (`lib/workingHours.ts`) narrows each day's base working-hours window by every applicable rule before subtracting busy time — so an auto-placed task/habit/focus-time block, or a bump/reschedule/rebalance relocation target, is never even offered a rule-violating slot.
+2. **Write-side gate (`applyProposedChange`, `lib/proposedChanges.ts`):** a `create`/`move` proposal with an explicit `proposed_start` is checked against every applicable rule at apply time, the same way conflict-detection already gates a real double-booking — fails with a descriptive error naming the violated rule, unless the proposal opts out (see `proposed_changes.ignore_scheduling_rules` below). This is what makes "it's okay to write to the calendar while ignoring rules" possible as a deliberate, explicit per-write choice (confirmed design — not a soft/hard flag on the rule itself, a bypass on the write) — same "hard manual option to override" shape as `bump_if_movable` (item 24).
+
+**Known v1 scoping limit:** the write-side gate on a `move` change_type matches tag-scoped rules against the *proposal's own* `tags` field (which `move` doesn't otherwise use/persist), not the target event's actual current tags — a direct `move` request that happens to violate a tag-scoped (not category-scoped) rule may not be caught by the write-gate, though `findFreeSlots`'s search side already fully respects tags when *choosing* a relocation target for every auto-generated mover (autoReschedule, dayRebalance, bump-relocation), so this gap only matters for a directly-requested `move` to an explicit time. Flagged, not fixed — narrow edge case, avoids restructuring the existing previous-state-capture read in the `move` branch just for this.
+
+**Setup SQL:**
+```sql
+create table scheduling_rules (
+  id             uuid primary key default gen_random_uuid(),
+  name           text,
+  category       text check (category in ('task','habit','focusTime','meeting','fixed','buffer','personal')),
+  tag            text,
+  starts_after   text,
+  starts_before  text,
+  weekdays       smallint[],
+  active         boolean not null default true,
+  created_at     timestamptz not null default now(),
+  updated_at     timestamptz not null default now(),
+  constraint scheduling_rules_one_scope_dimension check (not (category is not null and tag is not null)),
+  constraint scheduling_rules_needs_a_time_bound check (starts_after is not null or starts_before is not null),
+  -- Safe as a plain string comparison specifically because both columns are
+  -- always zero-padded "HH:mm" (enforced at the application layer via
+  -- lib/schedulingConfig.ts's parseTimeOfDay before insert/update) —
+  -- lexicographic order matches chronological order for that exact shape.
+  constraint scheduling_rules_before_after_order check (
+    starts_after is null or starts_before is null or starts_before > starts_after
+  )
+);
+
+grant select, insert, update, delete on scheduling_rules to service_role;
+notify pgrst, 'reload schema';
+```
+
+**New column on `proposed_changes`:**
+```sql
+alter table proposed_changes add column ignore_scheduling_rules boolean not null default false;
+notify pgrst, 'reload schema';
+```
+`ignore_scheduling_rules` (item 30): opt-in per-proposal, mirrors `bump_if_movable`'s shape exactly — set `true` on a `create`/`move` to skip the scheduling-rules write-gate above for that one write. Never implicitly grants a conflict-detection bypass too — those are independent checks (rules gate *when*, conflicts gate *is this time already busy*), and `bump_if_movable` remains the only sanctioned way past a real conflict.
+
+**Access / No RLS:** same reasoning as `inbox_items`/`event_metadata`.
+
+---
+
+## `chat_conversations` / `chat_messages`
+
+Phase 5 (`backend-build-order.md`) — persistence for the NL chat layer (`POST /api/chat`), lightweight and text-only by deliberate design: these two tables store only the final user/assistant text of each turn. They do **not** store the `tool_use`/`tool_result` blocks the agentic loop generates while producing that reply — those are used only within the request that generated them and then discarded. "Open state" (pending proposals, pending groups, recently-decided actions) is recomputed fresh from `proposed_changes`/`tasks`/`habits` on every single `/api/chat` call rather than replayed from this history — confirmed design choice, avoids unbounded context growth from replaying a full Anthropic message array turn after turn, and matches the same "recompute state fresh, don't trust stale history" philosophy the rest of this system already uses (e.g. `scheduling_rules`/`AUTO_APPLY_CATEGORIES` are always read live, never cached across requests).
+
+### `chat_conversations`
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | `uuid` | Primary key, default-generated |
+| `created_at` | `timestamptz` | Default `now()` |
+| `updated_at` | `timestamptz` | Bumped on every new message — lets a future client list/sort conversations by recency without a join |
+
+### `chat_messages`
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | `uuid` | Primary key, default-generated |
+| `conversation_id` | `uuid` | References `chat_conversations(id)` |
+| `role` | `text` | `'user'` or `'assistant'` — `check` constrained. No `'system'`/`'tool'` role stored, ever — see this section's top note |
+| `content` | `text` | Plain text only. For an assistant turn that ended in `ask_clarifying_question`, the clarifying question text itself is stored here as an ordinary assistant turn — it's a legitimate conversational turn, just one that short-circuited the tool loop early |
+| `created_at` | `timestamptz` | Default `now()` — history is fetched ordered by this, most recent N |
+
+**Setup SQL:**
+```sql
+create table chat_conversations (
+  id         uuid primary key default gen_random_uuid(),
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+create table chat_messages (
+  id              uuid primary key default gen_random_uuid(),
+  conversation_id uuid not null references chat_conversations(id),
+  role            text not null check (role in ('user','assistant')),
+  content         text not null,
+  created_at      timestamptz not null default now()
+);
+
+create index chat_messages_conversation_idx on chat_messages (conversation_id, created_at);
+
+grant select, insert, update, delete on chat_conversations to service_role;
+grant select, insert, update, delete on chat_messages to service_role;
+notify pgrst, 'reload schema';
+```
 
 **Access / No RLS:** same reasoning as `inbox_items`/`event_metadata`.

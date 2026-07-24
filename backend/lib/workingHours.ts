@@ -1,6 +1,7 @@
 import { DateTime } from 'luxon';
 import type { Interval } from './intervals';
 import { getSchedulingConfig, type SchedulingConfig } from './schedulingConfig';
+import { narrowDayWindowByRules, type SchedulingRuleRow } from './schedulingRules';
 
 // Iterates calendar days *in the home timezone* (via `.plus({ days: 1 })`,
 // never raw 24h-ms increments) so DST days — which are 23 or 25 hours long
@@ -12,7 +13,12 @@ import { getSchedulingConfig, type SchedulingConfig } from './schedulingConfig';
 export function generateWorkingWindows(
   rangeStart: Date,
   rangeEnd: Date,
-  config: SchedulingConfig = getSchedulingConfig()
+  config: SchedulingConfig = getSchedulingConfig(),
+  // Phase 3.5 item 30 — already-fetched, already-scope-filtered rules (see
+  // lib/schedulingRules.ts's fetchApplicableSchedulingRules) for whatever's
+  // being placed. Pure by design, same as the rest of this function — the
+  // caller (lib/freeSlots.ts's findFreeSlots) does the actual Supabase read.
+  rules: SchedulingRuleRow[] = []
 ): Interval[] {
   const rangeStartMs = rangeStart.getTime();
   const rangeEndMs = rangeEnd.getTime();
@@ -41,7 +47,11 @@ export function generateWorkingWindows(
       const clippedEnd = Math.min(windowEnd.toMillis(), rangeEndMs);
 
       if (clippedEnd > clippedStart) {
-        windows.push({ start: clippedStart, end: clippedEnd });
+        const window =
+          rules.length > 0
+            ? narrowDayWindowByRules({ start: clippedStart, end: clippedEnd }, cursor.weekday, rules, cursor)
+            : { start: clippedStart, end: clippedEnd };
+        if (window) windows.push(window);
       }
     }
 

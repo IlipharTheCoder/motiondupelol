@@ -57,6 +57,23 @@ export async function POST(request: Request) {
   if (body.bump_if_movable !== undefined && typeof body.bump_if_movable !== 'boolean') {
     return Response.json({ error: '"bump_if_movable" must be a boolean' }, { status: 400 });
   }
+  if (
+    body.weekdays !== undefined &&
+    (!Array.isArray(body.weekdays) ||
+      body.weekdays.length === 0 ||
+      body.weekdays.some((d: unknown) => !Number.isInteger(d) || (d as number) < 1 || (d as number) > 7))
+  ) {
+    return Response.json(
+      { error: '"weekdays" must be a non-empty array of integers 1-7 (1=Monday..7=Sunday)' },
+      { status: 400 }
+    );
+  }
+  if (
+    body.skip_dates !== undefined &&
+    (!Array.isArray(body.skip_dates) || body.skip_dates.some((d: unknown) => typeof d !== 'string'))
+  ) {
+    return Response.json({ error: '"skip_dates" must be an array of ISO date strings' }, { status: 400 });
+  }
 
   const input: RecurringSeriesInput = {
     category: body.category,
@@ -69,6 +86,8 @@ export async function POST(request: Request) {
     interval_weeks: intervalWeeks,
     count: hasCount ? body.count : undefined,
     until: hasUntil ? body.until : undefined,
+    weekdays: body.weekdays,
+    skip_dates: body.skip_dates,
     tags: body.tags,
     bump_if_movable: body.bump_if_movable,
     reason: body.reason,

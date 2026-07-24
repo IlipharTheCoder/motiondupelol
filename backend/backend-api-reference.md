@@ -146,6 +146,40 @@ There's no separate stored "all-day note vs. block" type — an all-day event (`
 
 ---
 
+## `POST /api/calendar/events/{id}/relocate`
+
+**Auth:** required — same as above
+
+**Request:** `application/json`, every field optional:
+```json
+{
+  "search_from": "ISO datetime (optional, default now)",
+  "search_to": "ISO datetime (optional, default search_from + 14 days)",
+  "bump_if_movable": "boolean (optional, default false)"
+}
+```
+An empty/missing body is fine — everything defaults.
+
+**What it does:** Phase 3.5 item 31 ("relocate a specific event") — collapses the `get_events` → `find_free_slots` → `propose_change` three-call pattern for "push my dentist thing to next week, whenever's free" into one call, addressable by a specific event id rather than only reachable via a whole conflict scan (`POST /api/calendar/reschedule`) or a bump's occupant list (item 24). Reads the target event's own current duration/category/tags, searches `[search_from, search_to)` (clamped to not start before now) via `findFreeSlots` — which already respects active `scheduling_rules` (item 30) and working hours — for the first opening at least as long as the event's own duration, and proposes an ordinary `move` there (`category`/`tags` carried over from the event's own current metadata). Doesn't gate on the event's own `flexible` tag — this is a direct, deliberate request naming a specific event, not an automatic system decision `flexible` is meant to govern.
+
+`bump_if_movable` passes straight through to the resulting `move` proposal (item 24) — matters for the gap between "this slot was free when searched" and actual approval time (these proposals don't auto-apply by default), not because the freshly-found slot is expected to already conflict with anything.
+
+**Response:**
+```json
+{
+  "eventId": "string",
+  "searchFrom": "ISO datetime",
+  "searchTo": "ISO datetime",
+  "outcome": "proposed | no-slot-available",
+  "proposal": {}
+}
+```
+`proposal` is present only when `outcome: "proposed"` — see `GET /api/proposed-changes`'s response shape. `no-slot-available` (nothing fit in the window) is a normal response, not an error.
+
+**Errors:** `401` unauthorized, `404` if no event matches `id`, `400` if the event is all-day (all-day events never participate in scheduling — see `GET /api/calendar/free-slots`) or `search_from`/`search_to` are invalid/out of order, `500` on a Google API or Supabase failure. On-demand only — nothing in this backend runs on a schedule yet.
+
+---
+
 ## `POST /api/calendar/sync`
 
 **Auth:** required — `x-api-key` header must match `APP_SECRET_KEY`
@@ -212,9 +246,11 @@ Bounded to ~50s of work per call (Vercel `maxDuration: 60`). If a backfill is la
 
 **Auth:** required — `x-api-key` header must match `APP_SECRET_KEY`
 
-**Query params:** `from`, `to` (required, ISO datetimes) · `minDurationMinutes`, `paddingMinutes` (optional, non-negative numbers)
+**Query params:** `from`, `to` (required, ISO datetimes) · `minDurationMinutes`, `paddingMinutes` (optional, non-negative numbers) · `category` (optional, `BurnerEventType`) · `tags` (optional, comma-separated string, e.g. `tags=gym,personal`)
 
-**What it does:** computes open slots on the burner calendar within `[from, to)`, intersected with working hours (`HOME_TIMEZONE`/`WORKING_HOURS_START`/`WORKING_HOURS_END`/`WORKING_DAYS` — see `lib/schedulingConfig.ts`, defaults `America/New_York` 10:00–18:00 Mon–Fri). Every non-cancelled, timed burner event counts as busy regardless of its `flexible` tag — this primitive reports what's free, it doesn't decide what to do about conflicts (see `architecture-plan.md`/`backend-build-order.md` Phase 2). **All-day events never count as busy** (changed 2026-07-24 — see `lib/busyIntervals.ts`'s `normalizeEventToInterval`): they're treated as notes/markers, not scheduled time, so they're excluded before this or any other busy-interval computation ever sees them. `paddingMinutes` expands each busy event by that many minutes on both sides before subtracting (a generic knob, not built-in "buffer time" semantics); `minDurationMinutes` drops any resulting slot shorter than that.
+**What it does:** computes open slots on the burner calendar within `[from, to)`, intersected with working hours (`HOME_TIMEZONE`/`WORKING_HOURS_START`/`WORKING_HOURS_END`/`WORKING_DAYS` — see `lib/schedulingConfig.ts`, defaults `America/New_York` 10:00–18:00 Mon–Fri), further narrowed by any active `scheduling_rules` matching `category`/`tags` (item 30 — see `GET /api/scheduling-rules`; omitting both still applies any *global*, no-category/tag rule). Every non-cancelled, timed burner event counts as busy regardless of its `flexible` tag — this primitive reports what's free, it doesn't decide what to do about conflicts (see `architecture-plan.md`/`backend-build-order.md` Phase 2). **All-day events never count as busy** (changed 2026-07-24 — see `lib/busyIntervals.ts`'s `normalizeEventToInterval`): they're treated as notes/markers, not scheduled time, so they're excluded before this or any other busy-interval computation ever sees them. `paddingMinutes` expands each busy event by that many minutes on both sides before subtracting (a generic knob, not built-in "buffer time" semantics); `minDurationMinutes` drops any resulting slot shorter than that.
+
+`category`/`tags` are optional here specifically because this is a raw diagnostic/on-demand endpoint (no fixed placement context of its own) — every internal caller of the same underlying `findFreeSlots` (tasks/habits/focus-time planners, auto-reschedule, rebalance, bump-relocation) always passes its own known category/tags, so a real placement is never silently unaware of an applicable rule the way an unscoped call here can be.
 
 **Response:**
 ```json
@@ -227,7 +263,7 @@ Bounded to ~50s of work per call (Vercel `maxDuration: 60`). If a backfill is la
 }
 ```
 
-**Errors:** `401` unauthorized, `400` if `from`/`to` are missing/invalid/out of order or `minDurationMinutes`/`paddingMinutes` aren't valid non-negative numbers, `500` on a Google API or config failure
+**Errors:** `401` unauthorized, `400` if `from`/`to` are missing/invalid/out of order, `minDurationMinutes`/`paddingMinutes` aren't valid non-negative numbers, or `category` isn't a valid `BurnerEventType`, `500` on a Google API or config failure
 
 ---
 
@@ -333,14 +369,21 @@ Bounded to ~50s of work per call (Vercel `maxDuration: 60`). If a backfill is la
 **Request:** `application/json`:
 ```json
 {
-  "tag": "string (required)",
+  "tag": "string (optional)",
+  "category": "BurnerEventType[] (optional) — task/habit/focusTime/meeting/fixed/buffer/personal",
+  "priority_in": "EventPriority[] (optional) — critical/high/medium/low — match on CURRENT priority, distinct from \"priority\" below",
+  "starts_after": "string, HH:mm (optional) — local time-of-day in HOME_TIMEZONE, inclusive",
+  "starts_before": "string, HH:mm (optional) — local time-of-day in HOME_TIMEZONE, exclusive",
+  "summary_contains": "string (optional) — case-insensitive substring match",
+  "exclude_event_ids": "string[] (optional) — narrows another filter, doesn't stand in for one on its own",
+
   "from": "ISO datetime (required)",
   "to": "ISO datetime (required)",
   "action": "update | delete | move",
 
   "proposed_summary": "string (optional, action: update)",
   "proposed_description": "string (optional, action: update)",
-  "priority": "critical | high | medium | low (optional, action: update)",
+  "priority": "critical | high | medium | low (optional, action: update) — what to SET matching events' priority to",
   "deadline": "ISO datetime (optional, action: update)",
   "tags_add": "string[] (optional, action: update) — tags to add to each match",
   "tags_remove": "string[] (optional, action: update) — tags to remove from each match",
@@ -350,18 +393,32 @@ Bounded to ~50s of work per call (Vercel `maxDuration: 60`). If a backfill is la
   "reason": "string (optional, human-readable, carried into every resulting proposal)"
 }
 ```
-`action: 'update'` requires at least one of `proposed_summary`/`proposed_description`/`priority`/`deadline`/`tags_add`/`tags_remove`. `action: 'move'` requires `time_delta_minutes`. `action: 'delete'` needs nothing else.
+**At least one match filter is required** — `tag`, `category`, `priority_in`, `starts_after`, `starts_before`, or `summary_contains`; `exclude_event_ids` alone doesn't count (see below). Every filter given is AND-composed (a match must satisfy all of them); `category`/`priority_in` are themselves OR internally (any listed value matches). `action: 'update'` requires at least one of `proposed_summary`/`proposed_description`/`priority`/`deadline`/`tags_add`/`tags_remove`. `action: 'move'` requires `time_delta_minutes`. `action: 'delete'` needs nothing else.
 
-**What it does:** Phase 4 items 13/14 ("Labels" + "Bulk actions"), built together as prep for item 25's Option B recurring events — see `architecture-plan.md`. Finds every schedulable (timed, non-cancelled) event in `[from, to)` carrying `tag` (reuses `lib/autoReschedule.ts`'s `fetchSchedulableEvents`, same "fetch the range, decode metadata, filter in code" pattern every engine here already uses — no Calendar API query-param filtering), then creates one ordinary `update`/`delete`/`move` `proposed_changes` row per match — never bypasses the review queue, same `AUTO_APPLY_CATEGORIES` handling as any other proposal. One match's failure (e.g. a `move` that lands on a conflict once applied) doesn't block the rest of the batch.
+**`priority_in` vs. `priority` (Phase 3.5 item 29, added 2026-07-24) — these are deliberately different fields, not a typo.** `priority` (further down, `action: 'update'` only) is what to *set* matching events' priority to. `priority_in` is a *match filter* — only consider events whose *current* priority is one of the listed values. Reusing the name `priority` for the filter would have silently collided with the existing set-value field.
+
+**`starts_after`/`starts_before`** are a **time-of-day** filter (`"HH:mm"`, e.g. `"15:00"`), not an absolute timestamp — a match is evaluated against that time-of-day in `HOME_TIMEZONE` on whichever day its own start falls on, so `starts_after: "15:00"` matches "after 3pm" on every day inside `[from, to)`, not just the first one. `starts_after` is inclusive, `starts_before` is exclusive (`[starts_after, starts_before)`, matching this backend's working-hours convention elsewhere). Both may be given together; `starts_before` must be later than `starts_after` — like `WORKING_HOURS_START`/`END`, an overnight time-of-day window (e.g. "after 10pm or before 6am") isn't supported in one call.
+
+**`exclude_event_ids`** never satisfies the "at least one filter" requirement by itself — "everything in range except these ids" is still an unbounded selector, just narrowed. It's meant to layer on top of a real filter, e.g. "cancel my meetings except the manager one" = `category: ["meeting"]` + `exclude_event_ids: [managerEventEventId]`.
+
+**What it does:** Phase 4 items 13/14 ("Labels" + "Bulk actions") + Phase 3.5 item 29 (filter-based selection, added 2026-07-24) — see `architecture-plan.md`. Finds every schedulable (timed, non-cancelled) event in `[from, to)` matching every given filter (reuses `lib/autoReschedule.ts`'s `fetchSchedulableEvents`, same "fetch the range, decode metadata, filter in code" pattern every engine here already uses — no Calendar API query-param filtering), then creates one ordinary `update`/`delete`/`move` `proposed_changes` row per match — never bypasses the review queue, same `AUTO_APPLY_CATEGORIES` handling as any other proposal. One match's failure (e.g. a `move` that lands on a conflict once applied) doesn't block the rest of the batch.
 
 - **`update`**: `tags_add`/`tags_remove` are additive/subtractive against each match's *own current* tags, never a full replace — a bulk update that doesn't mention a tag never touches it (important for a future recurring series' `series:<uuid>` linking tag surviving an unrelated bulk retag). `proposed_summary`/`proposed_description`/`priority`/`deadline`, when given, apply identically to every match (the single-event `update` proposal's own replace-if-provided behavior).
-- **`move`**: `time_delta_minutes` is a uniform offset applied to each match's own existing start/end (duration unchanged) — not a single absolute target time, which wouldn't make sense across multiple different-time matches.
+- **`move`**: `time_delta_minutes` is a uniform offset applied to each match's own existing start/end (duration unchanged) — not a single absolute target time, which wouldn't make sense across multiple different-time matches. Each resulting `move` proposal goes through the same active-`scheduling_rules` write-gate as any other `move` (item 30) — a shifted time that lands on a disallowed slot fails just that one match (`skipped-error`), same as a real conflict. There's no `ignore_scheduling_rules` equivalent exposed here; a match that needs to bypass a rule has to go through `POST /api/proposed-changes` directly instead.
 - **`delete`**: proposes deleting every match.
 
 **Response:**
 ```json
 {
-  "tag": "string",
+  "filters": {
+    "tag": "string | null",
+    "category": "BurnerEventType[] | null",
+    "priority_in": "EventPriority[] | null",
+    "starts_after": "string | null",
+    "starts_before": "string | null",
+    "summary_contains": "string | null",
+    "exclude_event_ids": "string[] | null"
+  },
   "rangeStart": "ISO datetime",
   "rangeEnd": "ISO datetime",
   "action": "update | delete | move",
@@ -373,9 +430,9 @@ Bounded to ~50s of work per call (Vercel `maxDuration: 60`). If a backfill is la
   ]
 }
 ```
-`eventsMatched: 0` (no matching tag found) is a normal, successful response, not an error.
+**Breaking response-shape change (2026-07-24, item 29):** the old top-level `"tag": "string"` field is replaced by `filters` (echoing every filter actually applied — useful for a thin client/NL layer to confirm what it searched for before showing results). `eventsMatched: 0` (nothing matched) is a normal, successful response, not an error.
 
-**Errors:** `401` unauthorized, `400` on a missing/invalid `tag`/`from`/`to`/`action`/action-specific field, `500` on a Google API or Supabase failure. On-demand only — nothing in this backend runs on a schedule yet.
+**Errors:** `401` unauthorized, `400` on a missing/invalid `from`/`to`/`action`/action-specific field, no match filter given, an invalid `category`/`priority_in` member, a malformed `starts_after`/`starts_before`, or `starts_before` not later than `starts_after`, `500` on a Google API or Supabase failure. On-demand only — nothing in this backend runs on a schedule yet.
 
 ---
 
@@ -396,6 +453,8 @@ Bounded to ~50s of work per call (Vercel `maxDuration: 60`). If a backfill is la
   "interval_weeks": "integer, positive (optional, default 1) — 1 = every week, 2 = every other week",
   "count": "integer, positive, at most 260 — exactly one of count/until is required",
   "until": "ISO datetime — exactly one of count/until is required",
+  "weekdays": "integer[] 1-7 (optional) — 1=Monday..7=Sunday, e.g. [1,3,5] for MWF; omit for the original single-weekday behavior",
+  "skip_dates": "string[] (optional) — ISO dates to exclude, e.g. [\"2027-12-24\"]",
   "tags": "string[] (optional) — merged with the auto-generated series tag, not a replacement for it",
   "bump_if_movable": "boolean (optional, default false) — applied to every occurrence's create proposal, see item 24",
   "reason": "string (optional, carried into every resulting proposal)"
@@ -404,9 +463,13 @@ Bounded to ~50s of work per call (Vercel `maxDuration: 60`). If a backfill is la
 
 **What it does:** Phase 5 item 25 ("Recurring events"), Option B — synthesizes N individual `create` proposals (one per occurrence) rather than a native Google `recurrence`/RRULE series, chosen specifically because items 13/14 (event tags + `POST /api/calendar/bulk-edit`) already solve Option B's usual weakness of having no way to treat the whole series as one unit. Every occurrence is tagged with a fresh, unique `series:<uuid>` (plus any `tags` you supply) — **save this tag from the response** to later edit or cancel the whole series via `POST /api/calendar/bulk-edit`.
 
-Each occurrence is an ordinary `create` proposal, going through the exact same review-queue path and per-instance `detectConflicts` check as any other create — a conflict on one occurrence fails only that one proposal, the rest are unaffected. Weekly cadence only (anchored to `first_start`'s own weekday and time-of-day); interval math is DST-safe (stays at the same local time-of-day across a spring-forward/fall-back transition between occurrences).
+Each occurrence is an ordinary `create` proposal, going through the exact same review-queue path and per-instance `detectConflicts` check as any other create — a conflict on one occurrence fails only that one proposal, the rest are unaffected. Weekly cadence (anchored to `first_start`'s own time-of-day, and — absent `weekdays` — its own weekday too); interval math is DST-safe (stays at the same local time-of-day across a spring-forward/fall-back transition between occurrences).
 
-**No default horizon — `count` or `until` is required, not both, not neither.** This is a deliberate choice: there's no "silently ran out" failure mode to worry about, but also no "recurring forever" in one call — a still-wanted indefinite series just means calling this again later with a new `first_start`. A hard ceiling of 260 occurrences (5 years weekly) applies regardless; if an `until`-bounded request would exceed it, the response comes back `truncated: true` with as many occurrences as fit.
+**`weekdays` (Phase 3.5 item 32, added 2026-07-24)** — omitted, this reproduces the original single-weekday behavior exactly (every existing caller is unaffected). Given (e.g. `[1,3,5]` for "MWF gym"), every listed weekday gets an occurrence each *active* week, all at `first_start`'s own time-of-day. `interval_weeks` skips whole weeks, not individual weekdays — "every other week, MWF" is 3 occurrences in each active week, none in the week between. `count` counts real (non-skipped) occurrences across every weekday combined, not per-weekday. A listed weekday that falls *before* `first_start`'s own date within its first calendar week is excluded that first week only (nothing generates before the series' own start) and starts appearing from the next active week.
+
+**`skip_dates` (item 32)** — an occurrence whose local calendar date matches an entry is dropped and does **not** count toward `count`: generation keeps going to find enough *real* occurrences (so `count: 10` with 2 skipped dates in range still yields 10 occurrences, just shifted later) — bounded by the same 260 ceiling below, counted against candidates *scanned* (skipped or not), so an unreasonable skip list can't cause a runaway scan.
+
+**No default horizon — `count` or `until` is required, not both, not neither.** This is a deliberate choice: there's no "silently ran out" failure mode to worry about, but also no "recurring forever" in one call — a still-wanted indefinite series just means calling this again later with a new `first_start`. A hard ceiling of 260 occurrences (5 years weekly, fewer in wall-clock time if `weekdays` has more than one entry — still comfortably more than any real use case) applies regardless; if a request would exceed it, the response comes back `truncated: true` with as many occurrences as fit.
 
 **Response:**
 ```json
@@ -422,7 +485,7 @@ Each occurrence is an ordinary `create` proposal, going through the exact same r
 }
 ```
 
-**Errors:** `401` unauthorized, `400` on a missing/invalid `category`/`proposed_summary`/`first_start`/`first_end`/`interval_weeks`/`count`/`until`/`tags`/`bump_if_movable`, `500` on a Google API or Supabase failure. On-demand only — nothing in this backend runs on a schedule yet.
+**Errors:** `401` unauthorized, `400` on a missing/invalid `category`/`proposed_summary`/`first_start`/`first_end`/`interval_weeks`/`count`/`until`/`weekdays`/`skip_dates`/`tags`/`bump_if_movable`, `500` on a Google API or Supabase failure. On-demand only — nothing in this backend runs on a schedule yet.
 
 ---
 
@@ -539,7 +602,7 @@ Each candidate is tagged `source_id` = the trigger event's Google event ID, so r
 
 **Auth:** required — same as above
 
-**Query params:** `status` (optional — one of `pending`/`applied`/`rejected`/`failed`; omit to return all rows)
+**Query params:** `status` (optional — one of `pending`/`applied`/`rejected`/`failed`; omit to return all rows) · `group_id` (optional, item 27 — return only rows sharing that `proposal_group_id`, e.g. to review a batch before approving it)
 
 **What it does:** lists rows from `proposed_changes` (see `backend-schema.md`), newest first. This is the human-in-the-loop review queue every scheduling feature writes into instead of touching the calendar directly.
 
@@ -571,10 +634,13 @@ Each candidate is tagged `source_id` = the trigger event's Google event ID, so r
   "duration_minutes": "number, positive (optional) — only meaningful for category: 'task'; see AI Tasks Part 2, architecture-plan.md section 4e",
   "deadline": "ISO datetime (optional) — a \"must be done by\" constraint, independent of proposed_start/proposed_end",
   "reason": "string (optional, human-readable justification)",
-  "bump_if_movable": "boolean (optional, default false) — only meaningful for create/move, see below"
+  "bump_if_movable": "boolean (optional, default false) — only meaningful for create/move, see below",
+  "ignore_scheduling_rules": "boolean (optional, default false) — only meaningful for create/move, see below"
 }
 ```
 `update` requires `target_event_id` plus at least one of `proposed_start`/`proposed_end`/`proposed_summary`/`proposed_description`/`priority`/`deadline`/`tags`/`source_id` (the last one links a task to this event — see `POST /api/tasks/{id}/schedule`). `tags` was added to this list 2026-07-24 (item 13) — previously accepted but silently meaningless for a real calendar `update` (only ever written for the task-list-intake shape), it now writes onto the event's own metadata too, so a tags-only update is a legitimate "something to change."
+
+**`proposed_summary`/`proposed_description`/`proposed_start`/`proposed_end` are omit-vs-empty aware (fixed 2026-07-24, item 28):** omitting a field from the request body leaves it untouched; explicitly sending `""` clears it (only meaningful for `proposed_description` in practice — Google requires a real event summary, and start/end are never legitimately empty). Bug history: an earlier version of this check used truthiness, which silently ignored an explicit empty value the same as an omitted one — found because `POST /api/proposed-changes/{id}/revert` needs to be able to restore a field to genuinely empty. The first fix attempt (checking `!== undefined`) was itself wrong for a subtler reason and caused a real regression: a `proposed_changes` row read back from Supabase reports an untouched column as `null`, never `undefined`, so that check let a `null` proposed_start/proposed_end through and sent Google a literal `{ dateTime: null }` on every update that didn't touch start/end — which fails with a confusing `"Start and end times must either both be date or both be dateTime"` error unrelated to what actually broke. The final, correct check is `!= null` (catches both `null` and `undefined`), matching the `tags` field's already-correct pattern just above.
 
 **`create` may omit `proposed_start`/`proposed_end` entirely — but only when `category` is `'task'`.** That shape means "add this to the task list" rather than "put this on the calendar" (`architecture-plan.md` section 4a) — `proposed_summary` becomes the task's title, `deadline` its due date, and applying it inserts into the `tasks` table (`backend-schema.md`) instead of calling the Calendar API; `target_event_id` stays `null`. `proposed_start` and `proposed_end` must both be present or both be absent — one without the other is a `400`. Every category other than `'task'` still requires both.
 
@@ -584,9 +650,13 @@ Note there's no `color_tag` input — color is always derived from `category` (`
 
 **What it does:** validates the input for its `change_type` (`lib/proposedChanges.ts`'s `validateProposalInput`), inserts a `pending` row, then checks `category` against the `AUTO_APPLY_CATEGORIES` env var (comma-separated `BurnerEventType` list, e.g. `habit,buffer`; empty/unset means nothing auto-applies). If `category` is whitelisted, the change is applied to the calendar immediately in the same request — the response reflects the final `applied`/`failed` state, not `pending`. If you want a chance to set `priority`/`tags` before a Todoist task-intake proposal becomes real, keep `task` out of `AUTO_APPLY_CATEGORIES`.
 
-Applying (whether via auto-apply here or via the `approve` endpoint below) re-checks for conflicts on `create`/`move` using `detectConflicts` (`GET /api/calendar/conflicts`'s underlying function) — a conflict fails the change (`status: "failed"`, descriptive `error_message`) rather than double-booking. `create` builds `extendedProperties.private` via `encodeEventMetadata`; `update` reads the existing event first and merges changed fields into its metadata (Google's `patch` replaces the whole `extendedProperties.private` map rather than merging individual keys, so the full map is always resent) — `color_tag` is re-derived from whichever category ends up written, not preserved from the stale row.
+Applying (whether via auto-apply here or via the `approve` endpoint below) checks a `create`/`move`'s explicit time against active `scheduling_rules` (item 30, see `GET /api/scheduling-rules` — unless `ignore_scheduling_rules` below), then re-checks for conflicts using `detectConflicts` (`GET /api/calendar/conflicts`'s underlying function) — either fails the change (`status: "failed"`, descriptive `error_message`) rather than writing something disallowed or double-booked. `create` builds `extendedProperties.private` via `encodeEventMetadata`; `update` reads the existing event first and merges changed fields into its metadata (Google's `patch` replaces the whole `extendedProperties.private` map rather than merging individual keys, so the full map is always resent) — `color_tag` is re-derived from whichever category ends up written, not preserved from the stale row.
 
-**`bump_if_movable`** (added 2026-07-23, item 24) — on a conflict, instead of just failing, checks whether every conflicting event is `flexible` and *strictly* lower priority than this one (`critical` > `high` > `medium` > `low` — equal priority doesn't bump, matching `lib/autoReschedule.ts`'s mover rule). If so, each occupant gets its own ordinary `move` proposal into a free slot found within the next 14 days — but **this proposal still ends up `failed`**, not applied: the occupant hasn't actually vacated the slot yet, only been proposed to. The `error_message` names the blocking proposal(s) to approve first; once you do, retry this one (the normal `POST /api/proposed-changes/{id}/approve` retry-a-failed-proposal flow — no new mechanism). If even one conflicting event is immovable or equal/higher priority, nothing is bumped — same plain conflict failure as `bump_if_movable: false`. The occupant's move proposal always lands `pending` regardless of `AUTO_APPLY_CATEGORIES` — a bump is never allowed to silently cascade onto the real calendar without you approving it.
+**`bump_if_movable`** (added 2026-07-23, item 24) — on a conflict, instead of just failing, checks whether every conflicting event is `flexible` and *strictly* lower priority than this one (`critical` > `high` > `medium` > `low` — equal priority doesn't bump, matching `lib/autoReschedule.ts`'s mover rule). If so, each occupant gets its own ordinary `move` proposal into a free slot found within the next 14 days — but **this proposal still ends up `failed`**, not applied: the occupant hasn't actually vacated the slot yet, only been proposed to. The `error_message` names the blocking proposal(s) to approve first; once you do, retry this one (the normal `POST /api/proposed-changes/{id}/approve` retry-a-failed-proposal flow — no new mechanism). If even one conflicting event is immovable or equal/higher priority, nothing is bumped — same plain conflict failure as `bump_if_movable: false`. The occupant's move proposal always lands `pending` regardless of `AUTO_APPLY_CATEGORIES` — a bump is never allowed to silently cascade onto the real calendar without you approving it. **A scheduling-rules violation is never bumpable** — the time itself is disallowed regardless of what (if anything) is occupying it, so `bump_if_movable` has no effect on that check; only `ignore_scheduling_rules` does.
+
+**`ignore_scheduling_rules`** (added 2026-07-24, item 30) — skips the scheduling-rules check above for this one write, independent of conflict handling (never implies `bump_if_movable`, and vice versa). This is what makes "write it here anyway, I know it breaks a rule" a deliberate, explicit per-write choice rather than a silent bypass — same "hard manual option to override" shape as `bump_if_movable`. `findFreeSlots`-driven planners (tasks/habits/focus-time auto-placement, auto-reschedule, rebalance, bump-relocation) never need this themselves, since they only ever search for and propose already-rule-compliant slots in the first place — it's for a caller requesting a specific, known time directly. **Known v1 gap:** for `move`, the rule check matches tag-scoped rules against this proposal's own `tags` field, not the target event's actual current tags (`move` doesn't otherwise use/persist `tags`) — see `backend-schema.md`'s `scheduling_rules` entry.
+
+**`previous_state`** (added 2026-07-24, item 28) — not a request field; ignored/overwritten to `null` if a body includes it. Populated automatically by `applyProposedChange` on a successful apply (immediate auto-apply here, or later via `approve`) — see `POST /api/proposed-changes/{id}/revert` below.
 
 **Response:** the created/updated `proposed_changes` row, plus a `message` field — a plain-language summary of `status` (`lib/proposedChanges.ts`'s `describeProposalOutcome`) meant for a thin client to display directly: `"Awaiting approval."` / `"Change applied to the calendar."` / `"Change rejected."` / `` `"Failed to apply: {error_message}"` ``.
 
@@ -619,6 +689,98 @@ Applying (whether via auto-apply here or via the `approve` endpoint below) re-ch
 **Response:** the updated row plus `message`, `status: "rejected"`
 
 **Errors:** `401` unauthorized, `404` if no row matches `id`, `409` if the row's `status` isn't `pending` or `failed`, `500` on a Supabase failure
+
+---
+
+## `POST /api/proposed-changes/{id}/revert`
+
+**Auth:** required — same as above
+
+**Request:** no body
+
+**What it does:** Phase 3.5 item 28 ("undo") — turns an already-`applied` proposal into the opposite change, using the `previous_state` snapshot `applyProposedChange` captured immediately before its original write (`lib/proposedChanges.ts`'s `buildRevertInput`/`revertProposedChange`). Same review-queue principle as everywhere else in this API: this does **not** touch the calendar itself — it creates a brand-new compensating `proposed_changes` row and returns it, deliberately bypassing `AUTO_APPLY_CATEGORIES` (`skipAutoApply: true`, same mechanism `bump_if_movable`'s occupant-relocation uses) so it always lands `pending` regardless of category. "Undo that" is a two-call shape: this endpoint, then `POST /api/proposed-changes/{id}/approve` on the row it returns — not a new one-call mechanism.
+
+The compensating change per original `change_type`:
+- **`create` → `delete`** the resulting event — `409` if the original `create` was the task-list-intake shape (no `proposed_start`/`proposed_end`), since that never wrote to the calendar and there's nothing to revert.
+- **`move` → `move`** back to the captured previous `start`/`end` (the only fields a move ever changes).
+- **`update` → `update`** every captured field (`summary`/`description`/`start`/`end`/`priority`/`deadline`/`tags`/`flexible`) back to its pre-write value — a full restore, not a diff, so fields the original update didn't touch are simply set back to the value they already have (a no-op for those).
+- **`delete` → `create`** a new event reconstructed from the captured snapshot. This is necessarily a *new* event with a new id — Google doesn't support resurrecting a deleted event's own id, so `target_event_id` on the resulting proposal (once approved) won't match the one that was deleted.
+
+Because `previous_state` capture is generic to `applyProposedChange` itself (not special-cased for reverts), approving the compensating proposal captures its *own* `previous_state` the same way — a revert can itself be reverted, no special-casing needed.
+
+**Response:** the newly-created compensating `proposed_changes` row (`status: "pending"`), plus `message` — same shape as `POST /api/proposed-changes`. This is **not** the original row; the original row's own `status` stays `applied`.
+
+**Errors:** `401` unauthorized, `404` if no row matches `id`, `409` if the row's `status` isn't `applied`, or if it's `applied` but has nothing to revert (a task-list-intake `create`, or an `applied` row from before this column existed — `previous_state` is `null`), `500` on a Google API or Supabase failure
+
+---
+
+## `POST /api/proposed-changes/batch`
+
+**Auth:** required — same as above
+
+**Request:** `application/json`:
+```json
+{
+  "proposals": "ProposedChangeInput[] (required, non-empty, at most 50) — same shape as POST /api/proposed-changes, one per item",
+  "reason": "string (optional) — fallback default for any item that doesn't specify its own \"reason\""
+}
+```
+
+**What it does:** Phase 3.5 item 27 ("batch proposals") — the efficiency case this exists for: a single NL sentence like "move everything after 3pm to tomorrow" or "cancel my meetings except the manager one" naturally produces N proposals, and approving them one at a time is N round trips through a chat loop. Generates one `proposal_group_id` (server-side `crypto.randomUUID()`, never client-settable) shared by every row created in this call, then creates each item through the exact same path as a standalone `POST /api/proposed-changes` — same validation, same tag normalization, same `AUTO_APPLY_CATEGORIES` behavior per item (batching doesn't change what happens to any individual proposal, just gives the resulting rows a shared handle). One item's failure (bad validation, or an auto-applied item hitting a real conflict) doesn't abort the rest of the batch — same per-item try/catch shape as `POST /api/calendar/bulk-edit` and `POST /api/calendar/recurring`.
+
+A per-item `reason` wins over the batch-level `reason` if both are given; the batch-level one is a shared fallback, not an override.
+
+**Response:**
+```json
+{
+  "groupId": "uuid",
+  "proposalsRequested": 0,
+  "proposalsCreated": 0,
+  "skippedErrors": 0,
+  "results": [
+    { "index": 0, "outcome": "proposed | skipped-error", "proposal": {}, "reason": "string" }
+  ]
+}
+```
+
+**Errors:** `401` unauthorized, `400` if `proposals` is missing/empty/not-an-array/over 50 items, or `reason` isn't a string, `500` on an unexpected failure. Per-item validation failures don't 400 the whole request — they show up as `skipped-error` entries in `results`.
+
+---
+
+## `POST /api/proposed-changes/batch/{groupId}/approve`
+
+**Auth:** required — same as above
+
+**Request:** no body
+
+**What it does:** approves every still-open (`pending`/`failed`) row sharing that `proposal_group_id`, one at a time via the same logic as `POST /api/proposed-changes/{id}/approve` — one row's failure to apply doesn't block the rest of the group. A row already `applied`/`rejected` (e.g. it individually auto-applied via `AUTO_APPLY_CATEGORIES` at creation time, or was separately approved/rejected via the single-row endpoint before this call) is reported as `skipped-already-decided` rather than erroring the whole request.
+
+**Response:**
+```json
+{
+  "groupId": "uuid",
+  "rowsInGroup": 0,
+  "results": [
+    { "id": "uuid", "outcome": "applied | failed | skipped-already-decided", "proposal": {} }
+  ]
+}
+```
+
+**Errors:** `401` unauthorized, `404` if no row has that `proposal_group_id`, `500` on a Google API or Supabase failure
+
+---
+
+## `POST /api/proposed-changes/batch/{groupId}/reject`
+
+**Auth:** required — same as above
+
+**Request:** no body
+
+**What it does:** rejects every still-open row in the group, same `skipped-already-decided` handling as the `approve` variant above for anything already decided.
+
+**Response:** same shape as `approve`, `outcome` is `rejected | skipped-already-decided` instead
+
+**Errors:** `401` unauthorized, `404` if no row has that `proposal_group_id`, `500` on a Supabase failure
 
 ---
 
@@ -740,13 +902,13 @@ Same on-demand-only shape as `POST /api/todoist/sync` — nothing in this backen
 ```
 or
 ```json
-{ "proposed_start": "ISO datetime", "proposed_end": "ISO datetime", "bumpIfMovable": "boolean (optional, default false)" }
+{ "proposed_start": "ISO datetime", "proposed_end": "ISO datetime", "bumpIfMovable": "boolean (optional, default false)", "ignoreSchedulingRules": "boolean (optional, default false)" }
 ```
 Providing both or neither shape is a `400`.
 
 **What it does:** AI Tasks Part 1 (`architecture-plan.md` section 4d, `lib/aiTasks.ts`) — gives an `unscheduled` task a calendar presence, one of two ways:
 - **`event_id` (link to an existing event, e.g. an existing Focus Time block):** doesn't create/move/delete any calendar time — it tags that event's metadata with this task and marks the task `scheduled`. `actor` decides whether that's immediate or reviewed: `"user"` applies directly (a real Google Calendar write + `tasks` update in this same request, no `proposed_changes` row at all); `"ai-engine"` instead creates a `change_type: 'update'` proposal targeting `event_id`, only actually linking once that's approved.
-- **`proposed_start`/`proposed_end` (create a brand-new event for the task):** always goes through `proposed_changes` as a `create` regardless of `actor` — this genuinely creates calendar time, so it's never exempt from the review queue. `category: 'task'`, carrying over the task's title/description/deadline/priority. `bumpIfMovable` passes straight through as that proposal's `bump_if_movable` (item 24, see `POST /api/proposed-changes`) — if the requested slot conflicts with something flexible and lower-priority, that occupant gets its own relocation proposal instead of this request just failing, though this request still ends up `failed` pending your approval of that relocation either way.
+- **`proposed_start`/`proposed_end` (create a brand-new event for the task):** always goes through `proposed_changes` as a `create` regardless of `actor` — this genuinely creates calendar time, so it's never exempt from the review queue. `category: 'task'`, carrying over the task's title/description/deadline/priority. `bumpIfMovable` passes straight through as that proposal's `bump_if_movable` (item 24, see `POST /api/proposed-changes`) — if the requested slot conflicts with something flexible and lower-priority, that occupant gets its own relocation proposal instead of this request just failing, though this request still ends up `failed` pending your approval of that relocation either way. `ignoreSchedulingRules` (item 30) passes through the same way as `ignore_scheduling_rules` — skips the active-`scheduling_rules` check for this one write.
 
 Either way, the task must currently be `status: 'unscheduled'` — already-scheduled/completed/discarded tasks are a `409`.
 
@@ -939,9 +1101,98 @@ A task too big for any single opening anywhere in the window is skipped with a r
 
 ---
 
+## `GET /api/scheduling-rules`
+
+**Auth:** required — same as above
+
+**Query params:** `active` (optional — `"true"` or `"false"`; omit to return all rows)
+
+**What it does:** lists rows from `scheduling_rules` (`backend-schema.md`), newest first — Phase 3.5 item 30's standing constraints on *when* something may be scheduled.
+
+**Response:** array of `scheduling_rules` rows
+
+**Errors:** `401` unauthorized, `400` if `active` isn't `"true"`/`"false"`, `500` on a Supabase failure
+
+---
+
+## `POST /api/scheduling-rules`
+
+**Auth:** required — same as above
+
+**Request:** `application/json`:
+```json
+{
+  "name": "string (optional) — human-readable label, surfaced in write-gate rejection messages",
+  "category": "task | habit | focusTime | meeting | fixed | buffer | personal (optional)",
+  "tag": "string (optional)",
+  "starts_after": "string, \"HH:mm\" (optional) — local to HOME_TIMEZONE, inclusive",
+  "starts_before": "string, \"HH:mm\" (optional) — local to HOME_TIMEZONE, exclusive",
+  "weekdays": "integer[] 1-7 (optional) — 1=Monday..7=Sunday; omit/empty = every day"
+}
+```
+**`category` and `tag` are mutually exclusive** — a rule matches on category, or tag, or neither (a global rule, applying to everything), never both on the same row. **At least one of `starts_after`/`starts_before` is required**, and if both are given, `starts_before` must be later than `starts_after` (overnight time-of-day windows aren't supported, same limitation as `WORKING_HOURS_START`/`END`). New rules are always created `active: true`.
+
+**What it does:** Phase 3.5 item 30 — a standing, runtime-editable scheduling constraint, consumed by every planner that searches for an opening via `findFreeSlots` (`lib/freeSlots.ts`: tasks, habits, focus time, and the search side of auto-reschedule/rebalance/bump-relocation) so a rule-violating slot is never even offered, *and* as a write-time gate on any `create`/`move` with an explicit time (`POST /api/proposed-changes`, see `ignore_scheduling_rules` there) — same shape as a real conflict, just a policy violation instead of a double-booking. Direct insert, not routed through `proposed_changes` — a rule declaration is a standing policy, not a calendar write, same reasoning as `POST /api/habits`.
+
+**Combination semantics:** every *active* rule whose scope matches (category/tag/global) and whose `weekdays` includes the day in question **narrows the allowed window further** — an AND-intersection across every applicable rule, never a widening and never a single rule silently overriding a broader one. A rule missing one bound only constrains the side it has.
+
+**Response:** the created `scheduling_rules` row
+
+**Errors:** `401` unauthorized, `400` on a missing/invalid field, both `category` and `tag` given, neither `starts_after` nor `starts_before` given, or `starts_before` not later than `starts_after`, `500` on a Supabase failure
+
+---
+
+## `PATCH /api/scheduling-rules/{id}`
+
+**Auth:** required — same as above
+
+**Request:** `application/json`, at least one of `name`/`category`/`tag`/`starts_after`/`starts_before`/`weekdays`/`active`. Setting `active: false` is the pause mechanism — there's no delete route, same pattern as `habits`. This route doesn't re-read the row first, so a cross-field check (category+tag, at-least-one-time-bound, before>after) only catches a conflict introduced *within the same request* — a `PATCH` that only touches one side of an existing conflict relies on the DB-level backstops (`scheduling_rules_one_scope_dimension`, `scheduling_rules_needs_a_time_bound`, `scheduling_rules_before_after_order` — `backend-schema.md`), same limitation `PATCH /api/habits/{id}`'s `cadence`/`interval_days` check already has.
+
+**What it does:** edits a rule's fields, same field-by-field validation as `POST /api/scheduling-rules`.
+
+**Response:** the updated `scheduling_rules` row
+
+**Errors:** `401` unauthorized, `400` if no valid field is given or a field is invalid, `404` if no row matches `id`, `500` on a Supabase failure (including a DB constraint violation not already caught by the request-level checks above — surfaced as Postgres's raw message, not translated)
+
+---
+
+## `POST /api/chat`
+
+**Auth:** required — same as above (this is the Mac/iOS client's own authenticated call; the Anthropic API key lives server-side only and is never sent to or seen by the client)
+
+**Request:** `application/json`:
+```json
+{
+  "message": "string, required",
+  "conversation_id": "uuid (optional) — omit to start a new conversation"
+}
+```
+An unrecognized/stale `conversation_id` is treated as "start fresh" (a new conversation is created) rather than a `404` — a thin client re-sending a locally-cached id shouldn't hard-fail the chat.
+
+**What it does:** Phase 5 — the NL chat layer. Runs a manual agentic tool-calling loop (`lib/nlLoop.ts`, model `claude-haiku-4-5`, capped at 6 iterations) against Claude with ~31 tools (`lib/nlToolManifest.ts`) mapped onto this backend's existing capabilities (`lib/nlToolDispatch.ts`) — calendar reads, `proposed_changes` writes/decisions, task/habit/scheduling-rule declarations, and the various planning engines (bulk-edit, recurring series, relocate, reschedule/rebalance, focus/buffer/task/habit auto-placement). Every calendar-affecting tool still goes through the ordinary `proposed_changes` review queue — **the chat layer is a new caller, not a new write path**. Conversation history is lightweight and text-only (`chat_conversations`/`chat_messages`, `backend-schema.md`) — only final user/assistant text is persisted, never intermediate tool calls; "open state" (pending proposals/groups, recent decisions), the calendar digest, resolved time anchors, and active scheduling rules are recomputed fresh from the live tables on every single call, never replayed from history.
+
+**Confirmed v1 posture — nothing auto-applies from chat:** `AUTO_APPLY_CATEGORIES` only keys on `category`, not `source_system` (item 20, still explicitly out of scope) — every proposal this layer creates lands `pending` and needs the same manual approval tap as any other `source_system`, regardless of how directly the user phrased the request. Revisit only if this turns out to be real friction in practice.
+
+**Model policy:** `claude-haiku-4-5` by default; escalate to `claude-sonnet-5` only for a specific step that proves too heavy for Haiku in practice. `claude-opus-4-8`/`claude-fable-5` are never used — standing project policy, not specific to this route.
+
+**Response:**
+```json
+{
+  "conversation_id": "uuid",
+  "reply": "string — the assistant's final text (or the clarifying question, if the loop short-circuited)",
+  "proposals": "ProposedChangeRow[] — whatever this turn's tool calls actually created",
+  "group_id": "string (optional) — set when a batch/bulk-edit/recurring-series call produced one",
+  "clarification": "string (optional) — present only when the loop exited via ask_clarifying_question; equal to \"reply\" in that case"
+}
+```
+
+**Errors:** `401` unauthorized, `400` if `message` is missing/empty or `conversation_id` is malformed, `500` on an Anthropic API failure or an uncaught Supabase/Google failure. A tool-level failure (bad input, a real conflict, a rule violation) does not surface as an HTTP error — it's caught and fed back to the model as a `tool_result` with `is_error: true`, so the model can react (retry, explain, fall back to `log_capability_gap`) rather than the whole request aborting.
+
+---
+
 ## Not yet built
 
-- **Item 20, source-system-aware auto-apply** — `AUTO_APPLY_CATEGORIES` only keys on `category`, not `source_system`. There is currently no way to auto-apply chat/NL-originated changes while still holding e.g. Todoist imports back for review — every `proposed_changes` row the NL layer creates (other than direct-insert `POST /api/tasks`/`POST /api/habits`, which bypass the queue entirely) sits `pending` needing a manual approval tap, regardless of how directly the user stated it. Worth an explicit decision before/while building the chat layer — either build this, or deliberately accept "everything the NL layer proposes onto the calendar needs a manual tap" as the v1 posture.
+- **Item 20, source-system-aware auto-apply** — `AUTO_APPLY_CATEGORIES` only keys on `category`, not `source_system`. There is currently no way to auto-apply chat/NL-originated changes while still holding e.g. Todoist imports back for review — every `proposed_changes` row the NL layer creates (other than direct-insert `POST /api/tasks`/`POST /api/habits`, which bypass the queue entirely) sits `pending` needing a manual approval tap, regardless of how directly the user stated it. Confirmed v1 posture (see `POST /api/chat` above): accept this as-is; revisit only if the manual-tap friction turns out to matter in practice.
 - AI Tasks Part 3 — session-splitting for tasks too large for any single free opening (Phase 3 item 7; Parts 1 and 2 are done — manual link/create via `POST /api/tasks/{id}/schedule`, auto-placement via `POST /api/tasks/plan`)
 - A deadline-driven reprioritization method that lets deadline/period urgency override priority tier for either Tasks or Habits (today's ranking always lets tier win — a future, distinct item)
 - Per-habit preferred time-of-day windows (e.g. "only evenings")

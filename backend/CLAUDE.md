@@ -7,14 +7,15 @@ Full system design: `architecture-plan.md`
 Build order / what's next: `backend-build-order.md`
 Current API surface: `backend-api-reference.md`
 Current database schema: `backend-schema.md`
+Guiding principles + building blocks for the Xcode client: `app-development-guide.md` (synthesizes the three docs above for app-side work)
 
-**Read the relevant doc above before starting a task** — don't infer architecture decisions from scratch when they're already written down. (Note: these docs live at the repo root, not under a `docs/` directory — there is no `docs/` folder in this repo. An `ai-calendar-manager-spec.md` file was referenced by early planning but was never actually added to the repo; `backend-build-order.md` now carries the equivalent per-item detail inline instead, including a `table #N` cross-reference in each item pointing at where that classification would have lived.)
+**Read the relevant doc above before starting a task** — don't infer architecture decisions from scratch when they're already written down. (Note: these docs live at the repo root, not under a `docs/` directory — there is no `docs/` folder in this repo. An `ai-calendar-manager-spec.md` file was referenced by early planning but was never actually added to the repo; `backend-build-order.md` now carries the equivalent per-item detail inline instead, including a `table #N` cross-reference in each item pointing at where that classification would have lived. The one exception is `nl-reference/` — a small root-level subdirectory, same tier as `lib/`/`app/`, holding longer-form reference docs the Phase 5 chat layer's `read_reference` tool fetches on demand; this is not the forbidden `docs/` pattern, just a normal subdirectory.)
 
 ## Stack
 - Next.js (App Router), TypeScript, deployed on Vercel (Hobby/free tier)
 - Supabase (Postgres + Storage) — free tier
 - Google Calendar API via a service account (no OAuth — calendars are shared directly with the service account's email; see `architecture-plan.md` section 2a)
-- Claude API (`@anthropic-ai/sdk`) for the one AI-required feature (screenshot parsing) — not yet implemented, see `backend-api-reference.md`'s `POST /api/capture` entry
+- Claude API (`@anthropic-ai/sdk`) — used by the Phase 5 NL chat layer (`POST /api/chat`), and reserved for screenshot parsing (`POST /api/capture`, not yet implemented). **Model policy: `claude-haiku-4-5` by default everywhere in this repo; `claude-sonnet-5` only for a specific step that proves too heavy for Haiku in practice. `claude-opus-4-8`/`claude-fable-5` are never used** — standing project policy, confirmed explicitly by the user, overriding any tool/skill default that suggests otherwise.
 
 ## Conventions
 - Every route except `/api/health` must call `isAuthorized(request)` from `lib/auth.ts` as the first line of the handler, returning 401 immediately if it fails
