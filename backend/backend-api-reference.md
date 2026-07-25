@@ -811,7 +811,10 @@ A per-item `reason` wins over the batch-level `reason` if both are given; the ba
 
 **Request:** no body
 
-**What it does:** on-demand Todoist task sync (`architecture-plan.md` section 4a) — fetches your active Todoist tasks (`TODOIST_API_TOKEN`, a personal access token) and diffs the full list against `synced_tasks`. Every Todoist task with no `synced_tasks` row yet gets a `create` proposal into `proposed_changes` (`category: 'task'`, no `proposed_start`/`proposed_end`, `proposed_summary` = the task's title, `deadline` = its due date, `source_system: 'todoist'`) — this is the "add to the task list" shape described above, so nothing lands in `tasks` until you approve it (and, typically, set `priority`/`tags` first via `PATCH /api/proposed-changes/{id}`). Tasks that drop out of Todoist's active list (completed or deleted there — the REST API doesn't distinguish, and both get the same handling) either get silently withdrawn (if nothing user-visible happened yet: the intake proposal is still pending/failed, or already rejected) or get a `delete` proposal into the review queue (if already scheduled onto the calendar).
+**What it does:** on-demand Todoist task sync (`architecture-plan.md` section 4a) — fetches your active Todoist tasks (`TODOIST_API_TOKEN`, a personal access token) and diffs the full list against `synced_tasks`. Every Todoist task with no `synced_tasks` row yet gets a `create` proposal into `proposed_changes` (`category: 'task'`, no `proposed_start`/`proposed_end`, `proposed_summary` = the task's title, `deadline` = its due date, `source_system: 'todoist'`) — this is the "add to the task list" shape described above, so nothing lands in `tasks` until you approve it (and, typically, set `priority`/`tags` first via `PATCH /api/proposed-changes/{id}`). Tasks that drop out of Todoist's active list (completed or deleted there — the REST API doesn't distinguish; `checked`/`is_deleted` both just mean "not in the active list") get one of three handlings depending on how far the task got:
+- Never approved past the review queue (still `pending`/`failed`, or already rejected) — nothing user-visible happened yet, so it's silently withdrawn (the intake proposal is auto-rejected, `withdrawnUnscheduled` increments).
+- Approved and scheduled onto the calendar — a `delete` proposal for that calendar event lands in the review queue, same as any other calendar change; approving it later also flips the task to `status: 'completed'` (`applyProposedChange`'s delete branch).
+- Approved but not yet scheduled — marked `status: 'completed'` directly (changed 2026-07-25, previously `'discarded'` — see `POST /api/tasks/{id}/complete` below for why: now that a real "mark this done" action exists, `'completed'` is the more honest default for a vanished task, even though the API genuinely can't distinguish "you finished it" from "you deleted it" here). **Canvas sync (`POST /api/canvas/sync` below) was not changed and still uses `'discarded'`** for its equivalent case — not an oversight, just out of scope for this change; the two sources are inconsistent with each other until Canvas gets the same treatment.
 
 Same on-demand-only shape as `POST /api/calendar/sync` — nothing in this backend runs on a schedule yet.
 
@@ -944,6 +947,8 @@ Either way, the task must currently be `status: 'unscheduled'` — already-sched
 
 **Multiple tasks can be linked to the same event (added 2026-07-24)** — e.g. several small tasks batched into one Focus Time block. Nothing here checks whether `event_id` already has another task pointing at it, and nothing needs to: `tasks.scheduled_event_id` is a plain many-to-one pointer, never enforced unique. **Linking never touches the event's own title** (deliberate — see `GET /api/tasks`'s `scheduled_event_id` filter above for how to actually enumerate what's on a block; a title can only ever reflect one task's name and would go stale/misleading the moment a second task joins). Use `GET /api/tasks?scheduled_event_id=...` to see everything currently attached to a given block.
 
+**The event's description now reflects every currently-linked task (added 2026-07-25)** — a successful link (either mode, either `actor`, once actually applied) also regenerates a delimited section in the target event's `description` (`lib/eventTaskDescription.ts`'s `syncEventTaskDescription`) listing every `status: 'scheduled'` task pointed at that event, one per line, with its deadline if it has one. Anything else already in the description (a note, or `propose_calendar_change`'s own `proposed_description`) is preserved — only the delimited block is regenerated. This is **best-effort**: a description-write failure is swallowed and never undoes the link itself, which has already succeeded by that point.
+
 **Response:**
 - Direct link (`actor: 'user'`): `{ "mode": "linked-directly", "task": { ...updated tasks row... } }`
 - Proposed link (`actor: 'ai-engine'`): `{ "mode": "linked-via-proposal", "proposal": { ...proposed_changes row... } }`
@@ -959,13 +964,31 @@ Either way, the task must currently be `status: 'unscheduled'` — already-sched
 
 **Request:** no body
 
-**What it does:** the inverse of `POST /api/tasks/{id}/schedule` — detaches a task from its calendar block: `status` goes back to `'unscheduled'`, `scheduled_event_id` is cleared to `null`. Same "bookkeeping, not a scheduling decision" principle as linking itself: **this never touches or deletes the calendar event**, even if that event was originally created just for this task via the `proposed_start`/`proposed_end` shape above. Auto-deleting calendar state as a side effect of a task-table change would be a real destructive action this endpoint doesn't try to justify on your behalf — if the now-possibly-orphaned event should also go, that's a separate, explicit `delete` through the normal `proposed_changes` review queue. If other tasks are still linked to the same event, they're completely unaffected — only the one task named in the URL changes.
+**What it does:** the inverse of `POST /api/tasks/{id}/schedule` — detaches a task from its calendar block: `status` goes back to `'unscheduled'`, `scheduled_event_id` is cleared to `null`. Same "bookkeeping, not a scheduling decision" principle as linking itself: **this never creates, moves, or deletes the calendar event**, even if that event was originally created just for this task via the `proposed_start`/`proposed_end` shape above. Auto-deleting calendar state as a side effect of a task-table change would be a real destructive action this endpoint doesn't try to justify on your behalf — if the now-possibly-orphaned event should also go, that's a separate, explicit `delete` through the normal `proposed_changes` review queue. If other tasks are still linked to the same event, they're completely unaffected — only the one task named in the URL changes.
+
+**One narrow, disclosed exception to "never touches the calendar event" (added 2026-07-25):** it does still patch the event's generated tasks-description section (best-effort, same as linking above) so the description doesn't keep listing a task that's no longer actually attached — confirmed directly as worth that tradeoff against the otherwise-strict guarantee above.
 
 **What it does not check:** whether this was the task currently reflected in the event's own `sourceId` metadata (only ever "whichever task linked most recently" once multiple tasks share a block, see `GET /api/tasks` above) — the event's metadata is never touched either way.
 
 **Response:** the updated `tasks` row (`status: 'unscheduled'`, `scheduled_event_id: null`)
 
 **Errors:** `401` unauthorized, `404` if no task matches `id`, `409` if the task's `status` isn't `'scheduled'` (nothing to unschedule), `500` on a Supabase failure
+
+---
+
+## `POST /api/tasks/{id}/complete`
+
+**Added 2026-07-25.** Auth: required — same as above
+
+**Request:** no body
+
+**What it does:** marks a task done (`lib/aiTasks.ts`'s `completeTask`) — the first direct, explicit "I finished this" action anywhere in the system. Before this existed, the only path to `status: 'completed'` was the indirect side effect of deleting a task's calendar event (`applyProposedChange`'s `delete` branch). Works whether the task is `'unscheduled'` or `'scheduled'` — **deliberately never touches `scheduled_event_id` or the calendar event itself**, even if the task was scheduled: the event stays exactly as it is, as an accurate historical record of when the work happened. This is a status flip, not an unschedule — contrast with `POST /api/tasks/{id}/unschedule` above, which is for "actually, don't do this in that block," not "I did this."
+
+**Same best-effort description-sync side effect as linking/unscheduling**: if the task was scheduled, the event's generated tasks-description section (`lib/eventTaskDescription.ts`) is refreshed so the now-completed task drops off the list (it only ever lists `status: 'scheduled'` tasks) — a description-write failure doesn't undo the completion, which has already succeeded by that point.
+
+**Response:** the updated `tasks` row (`status: 'completed'`)
+
+**Errors:** `401` unauthorized, `404` if no task matches `id`, `409` if the task's `status` is already `'completed'`/`'discarded'` (nothing to complete), `500` on a Supabase failure
 
 ---
 
@@ -1217,13 +1240,14 @@ A task too big for any single opening anywhere in the window is skipped with a r
 ```
 An unrecognized/stale `conversation_id` is treated as "start fresh" (a new conversation is created) rather than a `404` — a thin client re-sending a locally-cached id shouldn't hard-fail the chat.
 
-**What it does:** Phase 5 — the NL chat layer. **Completely rebuilt 2026-07-25** (per an explicit user decision) from a 33-tool surface down to exactly **two abilities**, because the prior surface was too large for `claude-haiku-4-5` to reliably keep track of, then **grown to six abilities the same day** to add task assignment and direct task creation:
+**What it does:** Phase 5 — the NL chat layer. **Completely rebuilt 2026-07-25** (per an explicit user decision) from a 33-tool surface down to exactly **two abilities**, because the prior surface was too large for `claude-haiku-4-5` to reliably keep track of, then **grown to seven abilities the same day** to add task assignment, direct task creation, and completion:
 - **`propose_calendar_change`** — create, move, or delete a calendar event (any category — a normal block, focus time, a meeting, a buffer, etc). No `priority` field — see "Priority at confirmation time" below.
 - **`find_free_time`** — read-only lookup of open time windows. **Unrestricted** (changed 2026-07-25) — ignores working hours and standing scheduling rules entirely, only excludes genuine calendar conflicts (`lib/freeSlots.ts`'s `ignoreWorkingHoursAndRules` option, forced on for this tool only — every other caller of `findFreeSlots` is unaffected). The model is instructed to use its own judgment about what's a reasonable time to suggest rather than relying on an algorithmic filter.
 - **`list_tasks`** — read-only, your unscheduled tasks ranked by urgency (wraps the same function behind `GET /api/tasks/next`). Lets the model resolve a task by name to an id before acting.
 - **`assign_task_to_event`** — assign an unscheduled task to a calendar block: link it to an event that already exists, or propose a brand-new one for it (`lib/aiTasks.ts`'s `linkTaskToExistingEvent`/`scheduleTaskToNewEvent`, same functions `POST /api/tasks/{id}/schedule` uses). Always creates a `pending` proposal — the model is hardcoded to the `'ai-engine'` actor, never `'user'`, so it can never take the direct-API's instant-apply path.
 - **`unassign_task`** — detach a task from its event (`lib/aiTasks.ts`'s `unscheduleTask`, same function `POST /api/tasks/{id}/unschedule` uses). Applies immediately, no proposal — matches the direct API's own precedent (pure `tasks`-table bookkeeping, never touches the calendar).
 - **`create_task`** — add a new task, optionally with a deadline (`lib/tasksWrite.ts`'s `createTask`, same function `POST /api/tasks` uses — that function was originally extracted from the route specifically in anticipation of this tool, per its own top comment, but never got one until now). Applies immediately, no proposal — same reasoning as `unassign_task` and the direct endpoint itself: a task the user states directly isn't external unreviewed data. Unlike a calendar block's priority, `tasks.priority` is a separate concern (confirmed directly by the user) — the model can set it here same as the direct API already allows at creation.
+- **`complete_task`** — mark a task done (`lib/aiTasks.ts`'s `completeTask`, same function `POST /api/tasks/{id}/complete` uses). Applies immediately, no proposal, and never touches the task's calendar event even if it was scheduled — the event stays as a record of when the work happened.
 
 Everything else from the prior surface (habits, scheduling-rule declarations, batch/group operations, bulk-edit, recurring series, relocate, reschedule/rebalance, focus/buffer/habit auto-placement, approve/reject/revert, an explicit data refresh, capability-gap logging, progressive-disclosure reference docs) is gone from chat entirely — still reachable through the rest of this API, just not from this conversation. Ambiguity is handled by the model just asking in its plain-text reply; there's no dedicated clarifying-question tool anymore.
 
@@ -1249,7 +1273,7 @@ Conversation history is lightweight and text-only (`chat_conversations`/`chat_me
     "cacheReadTokens": "number",
     "estimatedCostUsd": "number — computed from the above against claude-haiku-4-5's/claude-sonnet-5's published per-token rates and Anthropic's cache-read/write multipliers; NOT a billed total, an estimate (lib/nlLoop.ts's MODEL_PRICING, hardcoded, needs a manual update if pricing changes)"
   },
-  "tasks_changed": "boolean — true if create_task or unassign_task ran this turn (added 2026-07-25)"
+  "tasks_changed": "boolean — true if create_task, unassign_task, or complete_task ran this turn (added 2026-07-25)"
 }
 ```
 `group_id`/`clarification` no longer appear — there's no batch/group-producing tool and no dedicated clarifying-question tool anymore. **`tasks_changed`** exists because `create_task`/`unassign_task` mutate the `tasks` table directly with no `proposed_changes` row to carry the signal the way `propose_calendar_change`/`assign_task_to_event` already do via `proposals` — a client should reload its task list when this is `true`, the same way a non-empty `proposals` means reload the approval queue. **Note on caching:** with only 2 tools originally, the stable system-prompt prefix shrank to ~1,576 tokens — live-verified too small to trigger prompt caching at all (`cacheCreation1hTokens`/`cacheReadTokens` were both `0` on every test call). Now at 6 tools the prefix is larger again but this hasn't been re-measured — don't assume caching kicked back in without checking. The `cache_control` breakpoint is left in place either way (harmless if unused).
@@ -1267,3 +1291,4 @@ Conversation history is lightweight and text-only (`chat_conversations`/`chat_me
 - The cross-feature "AI Planner" orchestration layer (Phase 3 item 11) that would arbitrate Tasks/Habits/Focus Time/Buffers against each other for the same calendar time — each planner today only coordinates through shared calendar/pending-proposal state, independently triggered
 - Item 15, weekly time-spend reports; item 16, follow-up reminder notifications — both Phase 4, not started, lower priority
 - `POST /api/capture` (screenshot → Claude vision → inbox row) — see its own entry above; not implemented at all, don't list as a callable tool
+- **Canvas sync's vanished-unscheduled-task case still uses `'discarded'`, not `'completed'`** (added 2026-07-25) — `POST /api/todoist/sync` was updated to mark this case `'completed'` once a real complete action existed, but `POST /api/canvas/sync`'s equivalent branch (`lib/canvasSync.ts`) was deliberately left alone (out of scope for that change), so the two sources are inconsistent with each other. Revisit if/when Canvas sync is actually turned on (it's currently non-functional, on hiatus).

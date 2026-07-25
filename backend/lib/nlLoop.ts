@@ -114,7 +114,7 @@ export interface LoopResult {
 // just went stale. tasksChanged is the fix — a client refreshes its task
 // list when this comes back true, the same way a non-empty `proposals`
 // already signals "refresh the approval queue."
-const TASK_MUTATING_TOOLS = new Set(['create_task', 'unassign_task']);
+const TASK_MUTATING_TOOLS = new Set(['create_task', 'unassign_task', 'complete_task']);
 
 function extractText(content: Anthropic.ContentBlock[]): string {
   return content

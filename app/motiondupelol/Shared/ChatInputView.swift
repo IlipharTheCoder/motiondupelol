@@ -42,7 +42,7 @@ struct ChatInputView: View {
             HStack(alignment: .bottom, spacing: 8) {
                 TextField("Ask anything…", text: $input, axis: .vertical)
                     .textFieldStyle(.plain)
-                    .lineLimit(1...4)
+                    .lineLimit(3...10)
                     .focused($inputFocused)
                     .disabled(vm.isSending)
                     .onSubmit(send)

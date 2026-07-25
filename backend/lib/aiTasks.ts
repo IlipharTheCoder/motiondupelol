@@ -8,6 +8,7 @@ import {
   NotFoundError,
   type ProposedChangeRow,
 } from './proposedChanges';
+import { syncEventTaskDescription } from './eventTaskDescription';
 
 const BURNER_CALENDAR_ID = process.env.GOOGLE_BURNER_CALENDAR_ID!;
 const DEFAULT_TASK_DURATION_MINUTES = 30;
@@ -191,6 +192,15 @@ export async function linkTaskToExistingEvent(
       .single();
     if (error) throw new Error(`tasks update failed: ${error.message}`);
 
+    // Best-effort — keeps the event's description listing every currently
+    // linked task, but a failure here shouldn't undo the link itself, which
+    // already succeeded above.
+    try {
+      await syncEventTaskDescription(eventId);
+    } catch {
+      // Swallowed deliberately — see comment above.
+    }
+
     return { mode: 'linked-directly', task: updatedTask as TaskRow };
   }
 
@@ -215,19 +225,24 @@ export async function linkTaskToExistingEvent(
 
 // Detaches a task from its calendar block — the inverse of
 // linkTaskToExistingEvent, same "bookkeeping, not a scheduling decision"
-// principle: never touches the calendar event itself, even if that event
-// was originally created just for this task (scheduleTaskToNewEvent).
-// Auto-deleting or otherwise modifying the event on unschedule would be a
-// real destructive side effect on calendar state the task's own removal
-// doesn't obviously justify — if the leftover event should actually go too,
-// that's a separate, explicit delete through the normal proposed_changes
-// review queue. Symmetric requirement to linking's own assertUnscheduled:
-// only a 'scheduled' task can be unscheduled.
+// principle: never creates, moves, or deletes the calendar event itself,
+// even if that event was originally created just for this task
+// (scheduleTaskToNewEvent). Auto-deleting the event would be a real
+// destructive side effect on calendar state the task's own removal doesn't
+// obviously justify — if the leftover event should actually go too, that's
+// a separate, explicit delete through the normal proposed_changes review
+// queue. **One narrow, disclosed exception (2026-07-25):** it does patch
+// the event's generated tasks-description section (syncEventTaskDescription,
+// best-effort) so the description doesn't keep listing a task that's no
+// longer attached — confirmed worth this tradeoff against the otherwise
+// strict "never touches the calendar" guarantee. Symmetric requirement to
+// linking's own assertUnscheduled: only a 'scheduled' task can be unscheduled.
 export async function unscheduleTask(taskId: string): Promise<TaskRow> {
   const task = await getTask(taskId);
   if (task.status !== 'scheduled') {
     throw new ConflictError(`Task "${task.title}" is "${task.status}", not "scheduled" — nothing to unschedule`);
   }
+  const previousEventId = task.scheduled_event_id;
 
   const { data, error } = await supabase
     .from('tasks')
@@ -236,6 +251,57 @@ export async function unscheduleTask(taskId: string): Promise<TaskRow> {
     .select('*')
     .single();
   if (error) throw new Error(`tasks update failed: ${error.message}`);
+
+  // A deliberate, disclosed exception to this function's own "never touches
+  // the calendar event" guarantee above (2026-07-25) — keeping the event's
+  // description accurate (not still listing a task that's no longer
+  // attached) was confirmed as worth that tradeoff. Still best-effort: a
+  // failure here shouldn't undo the unschedule itself, which already
+  // succeeded above, and still never touches anything on the event besides
+  // the generated tasks section.
+  if (previousEventId) {
+    try {
+      await syncEventTaskDescription(previousEventId);
+    } catch {
+      // Swallowed deliberately — see comment above.
+    }
+  }
+
+  return data as TaskRow;
+}
+
+// Marks a task done (2026-07-25) — the only prior path to `'completed'` was
+// the indirect side effect of deleting the task's calendar event
+// (applyProposedChange's delete branch); this is the first direct, explicit
+// "I finished this" action, and works whether or not the task was ever
+// scheduled. Deliberately never touches `scheduled_event_id` or the calendar
+// event itself — the event (if any) stays as an accurate historical record
+// of when the work happened; this is a status flip, not an unschedule.
+export async function completeTask(taskId: string): Promise<TaskRow> {
+  const task = await getTask(taskId);
+  if (task.status !== 'unscheduled' && task.status !== 'scheduled') {
+    throw new ConflictError(`Task "${task.title}" is already "${task.status}" — nothing to complete`);
+  }
+
+  const { data, error } = await supabase
+    .from('tasks')
+    .update({ status: 'completed' })
+    .eq('id', taskId)
+    .select('*')
+    .single();
+  if (error) throw new Error(`tasks update failed: ${error.message}`);
+
+  // Best-effort, same reasoning as unscheduleTask above — a completed task
+  // should drop out of its event's generated tasks-description section
+  // (syncEventTaskDescription already only lists status: 'scheduled' tasks),
+  // but a description-write failure shouldn't undo the completion itself.
+  if (task.scheduled_event_id) {
+    try {
+      await syncEventTaskDescription(task.scheduled_event_id);
+    } catch {
+      // Swallowed deliberately — see comment above.
+    }
+  }
 
   return data as TaskRow;
 }

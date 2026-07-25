@@ -194,6 +194,27 @@ struct APIClient {
         try await post("/api/tasks", body: CreateTaskBody(title: title))
     }
 
+    // Marks a task done (2026-07-25) — works whether or not it was ever
+    // scheduled; never touches the task's calendar event if it had one.
+    func completeTask(id: String) async throws -> TaskItem {
+        var req = URLRequest(url: baseURL.appending(path: "/api/tasks/\(id)/complete"))
+        req.httpMethod = "POST"
+        req.setValue(apiKey, forHTTPHeaderField: "x-api-key")
+        let (data, response) = try await URLSession.shared.data(for: req)
+        guard let http = response as? HTTPURLResponse else {
+            throw APIError.server(message: "No HTTP response")
+        }
+        switch http.statusCode {
+        case 200..<300:
+            do { return try decoder().decode(TaskItem.self, from: data) }
+            catch { throw APIError.decoding(error) }
+        case 401: throw APIError.unauthorized
+        default:
+            let msg = (try? decoder().decode([String: String].self, from: data))?["error"] ?? "Complete failed"
+            throw APIError.server(message: msg)
+        }
+    }
+
     // Combined calendar + Todoist sync (POST /api/refresh). Called automatically
     // on launch/foreground (see MainView) — never a user-facing button. The
     // response has union-typed calendar/todoist fields nothing in the UI

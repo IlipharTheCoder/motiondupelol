@@ -20,6 +20,7 @@ import {
   linkTaskToExistingEvent,
   scheduleTaskToNewEvent,
   unscheduleTask,
+  completeTask,
 } from './aiTasks';
 import { createTask } from './tasksWrite';
 
@@ -80,6 +81,7 @@ export async function executeTool(name: string, rawInput: unknown): Promise<Tool
         // structural guarantee (not just a schema/prompt-level omission)
         // that a chat-created calendar event always lands with priority
         // unset, for you to decide at approval time (2026-07-25).
+        // eslint-disable-next-line @typescript-eslint/no-unused-vars
         const { priority: _ignoredPriority, ...rest } = input;
         const proposalInput = { ...rest, source_system: SOURCE_SYSTEM } as ProposedChangeInput;
         // skipAutoApply: true, always — structural guarantee that nothing
@@ -149,6 +151,9 @@ export async function executeTool(name: string, rawInput: unknown): Promise<Tool
             tags: input.tags as string[] | undefined,
           }),
         };
+
+      case 'complete_task':
+        return { result: await completeTask(requiredString(input, 'task_id')) };
 
       default:
         return { error: `Unknown tool "${name}"` };

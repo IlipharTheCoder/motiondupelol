@@ -1,7 +1,9 @@
 import SwiftUI
 
-// Top section of the new single-pane layout (2026-07-25 rebuild). View-and-create
-// only — the backend has no PATCH /api/tasks/{id} yet, so there's no edit UI.
+// Top section of the new single-pane layout (2026-07-25 rebuild). View,
+// create, and complete — the backend still has no PATCH /api/tasks/{id},
+// so there's no title/priority/deadline edit UI, just a checkmark to mark
+// a task done (POST /api/tasks/{id}/complete, added 2026-07-25).
 struct TaskListView: View {
     var vm: TasksViewModel
 
@@ -36,7 +38,7 @@ struct TaskListView: View {
                             .foregroundStyle(.secondary).font(.caption)
                     } else {
                         ForEach(vm.tasks) { task in
-                            TaskItemRow(task: task)
+                            TaskItemRow(task: task, onComplete: { await vm.complete(id: task.id) })
                         }
                     }
                 } header: {
@@ -91,27 +93,54 @@ struct TaskListView: View {
 
 private struct TaskItemRow: View {
     let task: TaskItem
+    let onComplete: () async -> Void
+
+    @State private var busy = false
+
+    // Mirrors the backend's own completeTask precondition (lib/aiTasks.ts) —
+    // only these two statuses can still be completed.
+    private var canComplete: Bool {
+        task.status == "unscheduled" || task.status == "scheduled"
+    }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 3) {
-            Text(task.title).font(.body)
-            HStack(spacing: 5) {
-                statusChip
-                if let pri = task.priority {
-                    Text(pri.capitalized)
-                        .font(.caption2)
-                        .padding(.horizontal, 5).padding(.vertical, 1)
-                        .background(priorityColor(pri).opacity(0.15))
-                        .foregroundStyle(priorityColor(pri))
-                        .clipShape(Capsule())
+        HStack(alignment: .top, spacing: 8) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(task.title).font(.body)
+                HStack(spacing: 5) {
+                    statusChip
+                    if let pri = task.priority {
+                        Text(pri.capitalized)
+                            .font(.caption2)
+                            .padding(.horizontal, 5).padding(.vertical, 1)
+                            .background(priorityColor(pri).opacity(0.15))
+                            .foregroundStyle(priorityColor(pri))
+                            .clipShape(Capsule())
+                    }
+                    if let deadline = task.deadlineDate {
+                        Text(deadline.formatted(.dateTime.month(.abbreviated).day()))
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
                 }
-                if let deadline = task.deadlineDate {
-                    Text(deadline.formatted(.dateTime.month(.abbreviated).day()))
-                        .font(.caption).foregroundStyle(.secondary)
+            }
+            Spacer()
+            if canComplete {
+                Button {
+                    busy = true
+                    Task {
+                        await onComplete()
+                        busy = false
+                    }
+                } label: {
+                    Image(systemName: "checkmark.circle")
                 }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+                .disabled(busy)
             }
         }
         .padding(.vertical, 2)
+        .opacity(busy ? 0.5 : 1)
     }
 
     private var statusChip: some View {

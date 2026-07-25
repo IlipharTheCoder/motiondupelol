@@ -21,6 +21,7 @@ import type { BusyInterval } from './busyIntervals';
 import { normalizeTags } from './normalizeTags';
 import { checkCandidateAgainstRules } from './schedulingRules';
 import { fetchApplicableSchedulingRules } from './schedulingRulesQuery';
+import { syncEventTaskDescription } from './eventTaskDescription';
 
 const BURNER_CALENDAR_ID = process.env.GOOGLE_BURNER_CALENDAR_ID!;
 const BUMP_SEARCH_HORIZON_DAYS = 14;
@@ -450,6 +451,17 @@ export async function applyProposedChange(
           .from('tasks')
           .update({ status: 'scheduled', scheduled_event_id: resultingEventId })
           .eq('id', row.source_id);
+
+        // Best-effort (2026-07-25) — same reasoning as the 'update' branch's
+        // isTaskLink case below: keeps the new event's description listing
+        // its attached task(s) in the same generated format a second task
+        // linking to it later would also use, but a failure here shouldn't
+        // undo the calendar create/task-link that already succeeded above.
+        try {
+          await syncEventTaskDescription(resultingEventId);
+        } catch {
+          // Swallowed deliberately — see comment above.
+        }
       }
     } else if (row.change_type === 'create') {
       // No proposed_start/proposed_end: a task-list intake (architecture-plan.md
@@ -585,6 +597,17 @@ export async function applyProposedChange(
           .from('tasks')
           .update({ status: 'scheduled', scheduled_event_id: row.target_event_id })
           .eq('id', row.source_id!);
+
+        // Best-effort (2026-07-25) — keeps the event's description listing
+        // every currently-linked task (lib/eventTaskDescription.ts), same as
+        // linkTaskToExistingEvent's direct-apply ('user' actor) path. A
+        // failure here shouldn't undo the link itself, which already
+        // succeeded above.
+        try {
+          await syncEventTaskDescription(row.target_event_id!);
+        } catch {
+          // Swallowed deliberately — see comment above.
+        }
       }
     } else if (row.change_type === 'delete') {
       // Unlike update/move, nothing else in this branch already reads the

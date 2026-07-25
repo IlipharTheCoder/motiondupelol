@@ -45,6 +45,14 @@
 // calendar-block's priority, task priority is a separate concern the user
 // explicitly confirmed is fine for the model to set directly here, same as
 // the direct API already allows at creation time.
+//
+// Grown to 7 tools (2026-07-25, same day): added complete_task, wrapping
+// lib/aiTasks.ts's completeTask — the first direct "I finished this" action
+// anywhere in the system (the only prior path to a task's 'completed'
+// status was the indirect side effect of deleting its calendar event).
+// Instant/unproposed, same reasoning as unassign_task/create_task — pure
+// tasks-table bookkeeping, never touches the calendar event itself even if
+// the task was scheduled (the event stays as an accurate historical record).
 import type Anthropic from '@anthropic-ai/sdk';
 import { BURNER_EVENT_TYPES, EVENT_PRIORITIES } from './eventMetadata';
 
@@ -139,6 +147,18 @@ export const NL_TOOLS: Anthropic.Tool[] = [
         tags: { type: 'array', items: { type: 'string' } },
       },
       required: ['title'],
+    },
+  },
+  {
+    name: 'complete_task',
+    description:
+      'Mark a task done — works whether or not it was ever scheduled onto the calendar. Applies immediately, no approval needed; this never touches the calendar event if the task had one (it stays as a historical record), only the task\'s own status changes.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        task_id: { type: 'string', description: 'The task to complete. Must currently be unscheduled or scheduled.' },
+      },
+      required: ['task_id'],
     },
   },
 ];

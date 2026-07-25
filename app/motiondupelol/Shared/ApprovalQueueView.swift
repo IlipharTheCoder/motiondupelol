@@ -6,10 +6,20 @@ import SwiftUI
 // vm itself polls independently every 25s while the app is active
 // (ProposedChangesViewModel.startPolling) — see that file for the race
 // this composition deliberately accepts rather than engineering around.
+//
+// Rows rendered as a single Grid (added 2026-07-25, replacing a tall
+// per-change VStack card) for a genuinely table-style, column-aligned,
+// compact layout — same Grid + @ViewBuilder-row-function pattern already
+// used by ChatInputView's UsageStatsBox in this codebase. Reason/error text
+// is truncated to one line as part of this compactness tradeoff; tap
+// behavior (approve/reject/set-priority) is unchanged.
 struct ApprovalQueueView: View {
     var vm: ProposedChangesViewModel
 
     @State private var isLoading = false
+    // Per-row busy tracking — a plain Set instead of a per-row @State, since
+    // rows are now @ViewBuilder function calls, not separate View structs.
+    @State private var busyIds: Set<String> = []
 
     var body: some View {
         List {
@@ -18,13 +28,10 @@ struct ApprovalQueueView: View {
                     Text("No pending changes")
                         .foregroundStyle(.tertiary).font(.caption).italic()
                 } else {
-                    ForEach(vm.pendingChanges) { change in
-                        PendingChangeRow(
-                            change: change,
-                            onApprove: { await vm.approve(id: change.id) },
-                            onReject: { await vm.reject(id: change.id) },
-                            onSetPriority: { priority in await vm.setPriority(id: change.id, priority: priority) }
-                        )
+                    Grid(alignment: .leading, horizontalSpacing: 8, verticalSpacing: 6) {
+                        ForEach(vm.pendingChanges) { change in
+                            changeRow(change)
+                        }
                     }
                 }
             } header: {
@@ -55,152 +62,121 @@ struct ApprovalQueueView: View {
             }
         }
     }
-}
 
-// MARK: - Pending change row
+    // MARK: - One table row: [type badge] [title + secondary line] [priority] [actions]
 
-private let PRIORITY_OPTIONS = ["critical", "high", "medium", "low"]
-
-private struct PendingChangeRow: View {
-    let change: ProposedChange
-    let onApprove: () async -> Void
-    let onReject: () async -> Void
-    let onSetPriority: (String) async -> Void
-
-    @State private var busy = false
-    private let isFailed: Bool
-    // Mirrors the backend's own isCalendarCreate gate (lib/proposedChanges.ts)
-    // exactly — a real calendar-block create with no priority yet, which the
-    // server refuses to approve (2026-07-25: priority deferred to review
-    // time for chat-created proposals). A move never needs priority, and the
-    // task-list-intake create shape (no start/end) means tasks.priority, a
-    // separate concern — neither is gated here either.
-    private let needsPriority: Bool
-
-    init(
-        change: ProposedChange,
-        onApprove: @escaping () async -> Void,
-        onReject: @escaping () async -> Void,
-        onSetPriority: @escaping (String) async -> Void
-    ) {
-        self.change = change
-        self.onApprove = onApprove
-        self.onReject = onReject
-        self.onSetPriority = onSetPriority
-        self.isFailed = change.status == "failed"
-        self.needsPriority = change.changeType == "create"
+    @ViewBuilder
+    private func changeRow(_ change: ProposedChange) -> some View {
+        let isFailed = change.status == "failed"
+        // Mirrors the backend's own isCalendarCreate gate (lib/proposedChanges.ts)
+        // exactly — a real calendar-block create with no priority yet, which the
+        // server refuses to approve (2026-07-25: priority deferred to review
+        // time for chat-created proposals). A move never needs priority, and the
+        // task-list-intake create shape (no start/end) means tasks.priority, a
+        // separate concern — neither is gated here either.
+        let needsPriority = change.changeType == "create"
             && change.proposedStartDate != nil
             && change.proposedEndDate != nil
             && change.priority == nil
-    }
+        let busy = busyIds.contains(change.id)
 
-    var body: some View {
-        VStack(alignment: .leading, spacing: 7) {
+        GridRow(alignment: .center) {
+            if let ct = change.changeType {
+                badge(ct.uppercased(), color: changeTypeColor(ct))
+            } else {
+                EmptyView()
+            }
 
-            // ── Top row: change-type badge + optional failed badge + priority ──
-            HStack(spacing: 5) {
-                if let ct = change.changeType {
-                    badge(ct.uppercased(), color: changeTypeColor(ct))
-                }
-                if isFailed {
-                    badge("FAILED", color: .red)
-                }
-                Spacer()
-                if let pri = change.priority {
-                    Text(pri.capitalized)
-                        .font(.system(.caption2, weight: .medium))
-                        .foregroundStyle(priorityColor(pri))
-                } else if needsPriority {
-                    Menu {
-                        ForEach(PRIORITY_OPTIONS, id: \.self) { option in
-                            Button(option.capitalized) {
-                                Task { await onSetPriority(option) }
-                            }
-                        }
-                    } label: {
-                        Label("Set priority", systemImage: "flag.badge.ellipsis")
-                            .font(.system(.caption2, weight: .medium))
+            VStack(alignment: .leading, spacing: 1) {
+                HStack(spacing: 5) {
+                    Text(change.proposedSummary ?? change.message ?? "Proposed change")
+                        .font(.subheadline)
+                        .lineLimit(1)
+                    if isFailed {
+                        badge("FAILED", color: .red)
                     }
-                    .disabled(busy)
                 }
-            }
-
-            // ── Title ──────────────────────────────────────────────────────────
-            Text(change.proposedSummary ?? change.message ?? "Proposed change")
-                .font(.subheadline)
-                .fixedSize(horizontal: false, vertical: true)
-
-            // ── Time window ────────────────────────────────────────────────────
-            if let start = change.proposedStartDate {
-                HStack(spacing: 4) {
-                    Image(systemName: "clock")
+                if let secondary = secondaryLine(change, isFailed: isFailed) {
+                    Text(secondary)
                         .font(.caption2)
-                        .foregroundStyle(.secondary)
-                    Text(timeLabel(start: start, end: change.proposedEndDate))
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(isFailed ? .red : .secondary)
+                        .lineLimit(1)
                 }
             }
 
-            // ── Reason ─────────────────────────────────────────────────────────
-            if let reason = change.reason, !reason.isEmpty {
-                Text(reason)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(2)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-
-            // ── Error message (failed only) ────────────────────────────────────
-            if isFailed, let err = change.errorMessage, !err.isEmpty {
-                HStack(alignment: .top, spacing: 4) {
-                    Image(systemName: "exclamationmark.circle.fill")
-                        .foregroundStyle(.red)
-                    Text(err)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                .font(.caption)
-                .foregroundStyle(.red)
-            }
-
-            // ── Approve / Reject ───────────────────────────────────────────────
-            if needsPriority {
-                Text("Set a priority above before you can approve this.")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-            }
-            HStack(spacing: 8) {
-                Button {
-                    busy = true
-                    Task {
-                        await onApprove()
-                        busy = false
+            if let pri = change.priority {
+                Text(pri.capitalized)
+                    .font(.system(.caption2, weight: .medium))
+                    .foregroundStyle(priorityColor(pri))
+            } else if needsPriority {
+                Menu {
+                    ForEach(PRIORITY_OPTIONS, id: \.self) { option in
+                        Button(option.capitalized) {
+                            Task { await vm.setPriority(id: change.id, priority: option) }
+                        }
                     }
                 } label: {
-                    Label(isFailed ? "Retry" : "Approve",
-                          systemImage: isFailed ? "arrow.clockwise" : "checkmark")
+                    Image(systemName: "flag.badge.ellipsis")
+                        .font(.caption)
+                }
+                .disabled(busy)
+            } else {
+                EmptyView()
+            }
+
+            HStack(spacing: 4) {
+                Button {
+                    runApprove(change.id)
+                } label: {
+                    Image(systemName: isFailed ? "arrow.clockwise" : "checkmark")
                 }
                 .buttonStyle(.borderedProminent)
-                .controlSize(.mini)
+                .controlSize(.small)
                 .disabled(busy || needsPriority)
+                .help(needsPriority ? "Set a priority before approving" : (isFailed ? "Retry" : "Approve"))
 
                 Button {
-                    busy = true
-                    Task {
-                        await onReject()
-                        busy = false
-                    }
+                    runReject(change.id)
                 } label: {
-                    Label("Reject", systemImage: "xmark")
+                    Image(systemName: "xmark")
                 }
                 .buttonStyle(.bordered)
-                .controlSize(.mini)
+                .controlSize(.small)
                 .tint(.secondary)
                 .disabled(busy)
+                .help("Reject")
             }
         }
-        .padding(.vertical, 5)
+        .padding(.vertical, 3)
         .opacity(busy ? 0.5 : 1)
+    }
+
+    private func secondaryLine(_ change: ProposedChange, isFailed: Bool) -> String? {
+        if isFailed, let err = change.errorMessage, !err.isEmpty { return err }
+        var parts: [String] = []
+        if let start = change.proposedStartDate {
+            parts.append(timeLabel(start: start, end: change.proposedEndDate))
+        }
+        if let reason = change.reason, !reason.isEmpty {
+            parts.append(reason)
+        }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
+    }
+
+    private func runApprove(_ id: String) {
+        busyIds.insert(id)
+        Task {
+            await vm.approve(id: id)
+            busyIds.remove(id)
+        }
+    }
+
+    private func runReject(_ id: String) {
+        busyIds.insert(id)
+        Task {
+            await vm.reject(id: id)
+            busyIds.remove(id)
+        }
     }
 
     @ViewBuilder
@@ -241,3 +217,5 @@ private struct PendingChangeRow: View {
         return s
     }
 }
+
+private let PRIORITY_OPTIONS = ["critical", "high", "medium", "low"]

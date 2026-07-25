@@ -224,7 +224,17 @@ export async function runTodoistSync(): Promise<TodoistSyncResult> {
         });
         result.proposedDeletes++;
       } else if (taskRow) {
-        await supabase.from('tasks').update({ status: 'discarded' }).eq('id', row.task_id);
+        // Completed → 'completed', not 'discarded' (changed 2026-07-25, now
+        // that a real 'completed' status/action exists — see
+        // lib/aiTasks.ts's completeTask). Todoist's API still can't actually
+        // distinguish "you checked it off" from "you deleted it" (`checked`
+        // and `is_deleted` both just mean "not in the active list" —
+        // fetchActiveTasks filters both out identically), so this remains
+        // an inference, not a certainty. 'completed' was judged the more
+        // honest default of the two for an unscheduled task that vanished:
+        // most Todoist tasks disappear because they were finished, and
+        // 'discarded' reads as "abandoned," which is the less common case.
+        await supabase.from('tasks').update({ status: 'completed' }).eq('id', row.task_id);
       }
 
       await supabase
