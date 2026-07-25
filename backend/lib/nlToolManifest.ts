@@ -19,8 +19,22 @@
 // lib/nlToolDispatch.ts additionally forces `skipAutoApply: true` on every
 // proposal this layer creates, so even a category later added to
 // AUTO_APPLY_CATEGORIES can never bypass manual review through this path.
+//
+// Grown to 5 tools (2026-07-25, same day): added list_tasks (read-only),
+// assign_task_to_event, and unassign_task — "assign a task to focus time/an
+// event" needed the model to see task ids (list_tasks) and to write the
+// link (assign_task_to_event, always a proposal — see nlToolDispatch.ts).
+// unassign_task is instant/unproposed, matching the direct API's own
+// unscheduleTask precedent (pure tasks-table bookkeeping, never touches the
+// calendar). This is still a deliberate, narrow grow — not a return to the
+// old 33-tool surface — each addition maps onto one already-built
+// lib/aiTasks.ts function.
+//
+// Same day: propose_calendar_change dropped its `priority` field entirely,
+// and find_free_time dropped `category`/`tags` and now ignores working
+// hours/scheduling_rules — see nlToolDispatch.ts's dispatch cases for both.
 import type Anthropic from '@anthropic-ai/sdk';
-import { BURNER_EVENT_TYPES, EVENT_PRIORITIES } from './eventMetadata';
+import { BURNER_EVENT_TYPES } from './eventMetadata';
 
 const CHANGE_TYPES = ['create', 'move', 'delete'];
 
@@ -28,7 +42,7 @@ export const NL_TOOLS: Anthropic.Tool[] = [
   {
     name: 'propose_calendar_change',
     description:
-      'Propose creating, moving, or deleting a calendar event (a normal block, focus time, a meeting, a buffer — any category). This only ever creates a "pending" proposal in the review queue — it never applies anything to the real calendar. The user must approve it themselves through the app; you cannot approve it, and there is no way to make this apply automatically.',
+      'Propose creating, moving, or deleting a calendar event (a normal block, focus time, a meeting, a buffer — any category). This only ever creates a "pending" proposal in the review queue — it never applies anything to the real calendar. The user must approve it themselves through the app; you cannot approve it, and there is no way to make this apply automatically. Priority is deliberately not a parameter here — the user always decides priority themselves when they review a create, not you.',
     input_schema: {
       type: 'object',
       properties: {
@@ -39,7 +53,6 @@ export const NL_TOOLS: Anthropic.Tool[] = [
         proposed_end: { type: 'string', description: 'ISO datetime. Required alongside proposed_start.' },
         proposed_summary: { type: 'string', description: 'Required for create — the event title.' },
         proposed_description: { type: 'string' },
-        priority: { type: 'string', enum: EVENT_PRIORITIES, description: 'Only meaningful for create.' },
         flexible: { type: 'string', enum: ['true', 'false'], description: 'Only meaningful for create.' },
         tags: { type: 'array', items: { type: 'string' }, description: 'Only meaningful for create.' },
         reason: { type: 'string', description: 'A short human-readable justification, shown in the review queue.' },
@@ -50,17 +63,53 @@ export const NL_TOOLS: Anthropic.Tool[] = [
   {
     name: 'find_free_time',
     description:
-      'Find open time windows in a range, honoring working hours and any standing scheduling rules. Read-only — does not create or change anything. Use this before propose_calendar_change when the user hasn\'t named an exact time themselves.',
+      'Find genuinely open time windows in a range — only excludes real calendar conflicts, not working hours or standing scheduling rules (unlike every other free-time search in this backend, this one is unrestricted). Use your own judgment to suggest reasonable times from what comes back rather than assuming every slot is equally appropriate to propose. Read-only — does not create or change anything. Use this before propose_calendar_change when the user hasn\'t named an exact time themselves.',
     input_schema: {
       type: 'object',
       properties: {
         from: { type: 'string', description: 'ISO datetime.' },
         to: { type: 'string', description: 'ISO datetime.' },
         min_duration_minutes: { type: 'number' },
-        category: { type: 'string', enum: BURNER_EVENT_TYPES, description: 'Narrows which standing scheduling rules apply to the search.' },
-        tags: { type: 'array', items: { type: 'string' } },
       },
       required: ['from', 'to'],
+    },
+  },
+  {
+    name: 'list_tasks',
+    description:
+      'List your unscheduled tasks (id, title, deadline, priority, duration), ranked most-urgent first. Read-only. Use this to find a task\'s id before calling assign_task_to_event.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        limit: { type: 'number', description: 'Max tasks to return. Defaults to 20.' },
+      },
+    },
+  },
+  {
+    name: 'assign_task_to_event',
+    description:
+      'Assign an unscheduled task to a calendar block — either linking it to a block that already exists (e.g. an existing Focus Time event) or proposing a brand-new event for it. Provide exactly one of event_id, or both proposed_start and proposed_end — never neither, never both. Always creates a "pending" proposal in the review queue, same guarantee as propose_calendar_change; it never applies directly, even though a human using the app directly can link to an existing event instantly.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        task_id: { type: 'string', description: 'The task to assign. Get this from list_tasks.' },
+        event_id: { type: 'string', description: 'Link to this already-existing event. Get it from the calendar digest already in context.' },
+        proposed_start: { type: 'string', description: 'ISO datetime — create a new event for the task starting here. Provide together with proposed_end, and omit event_id.' },
+        proposed_end: { type: 'string', description: 'ISO datetime. Required alongside proposed_start.' },
+      },
+      required: ['task_id'],
+    },
+  },
+  {
+    name: 'unassign_task',
+    description:
+      'Detach a scheduled task from its calendar event — the event itself is untouched, only the task\'s own status/link is cleared. Applies immediately; this is task-list bookkeeping, not a calendar write, so unlike every other write tool here it does not go through the review queue (same as the direct API).',
+    input_schema: {
+      type: 'object',
+      properties: {
+        task_id: { type: 'string', description: 'The task to unassign. Must currently be scheduled.' },
+      },
+      required: ['task_id'],
     },
   },
 ];

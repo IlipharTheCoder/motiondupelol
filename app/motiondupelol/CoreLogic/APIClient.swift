@@ -109,6 +109,31 @@ struct APIClient {
         }
     }
 
+    // Sets priority on a still-open (pending/failed) proposal. Required
+    // before approving a chat-created calendar-block proposal (2026-07-25) —
+    // propose_calendar_change/assign_task_to_event always leave priority
+    // unset, and the server refuses to apply one until this is called.
+    func setProposedChangePriority(id: String, priority: String) async throws -> ProposedChange {
+        var req = URLRequest(url: baseURL.appending(path: "/api/proposed-changes/\(id)"))
+        req.httpMethod = "PATCH"
+        req.setValue(apiKey, forHTTPHeaderField: "x-api-key")
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try JSONSerialization.data(withJSONObject: ["priority": priority])
+        let (data, response) = try await URLSession.shared.data(for: req)
+        guard let http = response as? HTTPURLResponse else {
+            throw APIError.server(message: "No HTTP response")
+        }
+        switch http.statusCode {
+        case 200..<300:
+            do { return try decoder().decode(ProposedChange.self, from: data) }
+            catch { throw APIError.decoding(error) }
+        case 401: throw APIError.unauthorized
+        default:
+            let msg = (try? decoder().decode([String: String].self, from: data))?["error"] ?? "Set priority failed"
+            throw APIError.server(message: msg)
+        }
+    }
+
     // Sends a message in the NL chat layer. Pass the last conversationId to
     // continue a thread; nil starts fresh. Stale ids are silently reset server-side.
     func chat(message: String, conversationId: String?) async throws -> ChatResponse {

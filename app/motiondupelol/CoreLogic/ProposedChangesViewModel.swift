@@ -38,6 +38,16 @@ final class ProposedChangesViewModel {
         pendingChanges.removeAll { $0.id == id }
     }
 
+    // Review-time priority pick for a chat-created calendar-block proposal
+    // (2026-07-25) — those always land with priority unset, and the server
+    // refuses to approve one until this is called first.
+    func setPriority(id: String, priority: String) async {
+        guard let updated = try? await APIClient.shared.setProposedChangePriority(id: id, priority: priority) else { return }
+        if let idx = pendingChanges.firstIndex(where: { $0.id == id }) {
+            pendingChanges[idx] = updated
+        }
+    }
+
     // Plain async loop, not Timer.publish — this codebase's own convention
     // is @Observable, not Combine (see app CLAUDE.md). Catches changes this
     // client didn't cause itself (e.g. a server-side auto-applied proposal);

@@ -22,7 +22,8 @@ struct ApprovalQueueView: View {
                         PendingChangeRow(
                             change: change,
                             onApprove: { await vm.approve(id: change.id) },
-                            onReject: { await vm.reject(id: change.id) }
+                            onReject: { await vm.reject(id: change.id) },
+                            onSetPriority: { priority in await vm.setPriority(id: change.id, priority: priority) }
                         )
                     }
                 }
@@ -58,19 +59,39 @@ struct ApprovalQueueView: View {
 
 // MARK: - Pending change row
 
+private let PRIORITY_OPTIONS = ["critical", "high", "medium", "low"]
+
 private struct PendingChangeRow: View {
     let change: ProposedChange
     let onApprove: () async -> Void
     let onReject: () async -> Void
+    let onSetPriority: (String) async -> Void
 
     @State private var busy = false
     private let isFailed: Bool
+    // Mirrors the backend's own isCalendarCreate gate (lib/proposedChanges.ts)
+    // exactly — a real calendar-block create with no priority yet, which the
+    // server refuses to approve (2026-07-25: priority deferred to review
+    // time for chat-created proposals). A move never needs priority, and the
+    // task-list-intake create shape (no start/end) means tasks.priority, a
+    // separate concern — neither is gated here either.
+    private let needsPriority: Bool
 
-    init(change: ProposedChange, onApprove: @escaping () async -> Void, onReject: @escaping () async -> Void) {
+    init(
+        change: ProposedChange,
+        onApprove: @escaping () async -> Void,
+        onReject: @escaping () async -> Void,
+        onSetPriority: @escaping (String) async -> Void
+    ) {
         self.change = change
         self.onApprove = onApprove
         self.onReject = onReject
+        self.onSetPriority = onSetPriority
         self.isFailed = change.status == "failed"
+        self.needsPriority = change.changeType == "create"
+            && change.proposedStartDate != nil
+            && change.proposedEndDate != nil
+            && change.priority == nil
     }
 
     var body: some View {
@@ -89,6 +110,18 @@ private struct PendingChangeRow: View {
                     Text(pri.capitalized)
                         .font(.system(.caption2, weight: .medium))
                         .foregroundStyle(priorityColor(pri))
+                } else if needsPriority {
+                    Menu {
+                        ForEach(PRIORITY_OPTIONS, id: \.self) { option in
+                            Button(option.capitalized) {
+                                Task { await onSetPriority(option) }
+                            }
+                        }
+                    } label: {
+                        Label("Set priority", systemImage: "flag.badge.ellipsis")
+                            .font(.system(.caption2, weight: .medium))
+                    }
+                    .disabled(busy)
                 }
             }
 
@@ -131,6 +164,11 @@ private struct PendingChangeRow: View {
             }
 
             // ── Approve / Reject ───────────────────────────────────────────────
+            if needsPriority {
+                Text("Set a priority above before you can approve this.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
             HStack(spacing: 8) {
                 Button {
                     busy = true
@@ -144,7 +182,7 @@ private struct PendingChangeRow: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .controlSize(.mini)
-                .disabled(busy)
+                .disabled(busy || needsPriority)
 
                 Button {
                     busy = true

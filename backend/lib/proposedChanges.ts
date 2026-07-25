@@ -346,6 +346,31 @@ export async function applyProposedChange(
 
   try {
     const isCalendarCreate = row.change_type === 'create' && !!row.proposed_start && !!row.proposed_end;
+
+    // Priority required at confirmation time for a real calendar-block
+    // create (2026-07-25) — chat-created proposals (propose_calendar_change,
+    // assign_task_to_event's new-event mode) deliberately leave priority
+    // unset so the user decides it at review, and this is the enforcement
+    // half of that: approving is blocked until PATCH /api/proposed-changes/{id}
+    // sets one. Deliberately scoped to `isCalendarCreate` only, not `move`
+    // (a move never sets/needs priority — it preserves whatever the target
+    // event already has) and not the task-list-intake create shape (no
+    // proposed_start/proposed_end — that priority means tasks.priority, a
+    // separate concern, unaffected by this). Every other engine that creates
+    // a calendar block (Focus Time, habits, auto-reschedule, etc.) already
+    // sets a real priority at creation time, so this never blocks those —
+    // it only ever catches a proposal that genuinely still needs a decision.
+    // Thrown as a plain Error (not ValidationError/ConflictError) so it's
+    // caught by this function's own try/catch below and surfaces as an
+    // ordinary `status: "failed"` row with this message as error_message —
+    // the same ergonomics as a scheduling-rule violation or a conflict, and
+    // the app's existing failed-proposal Retry flow already handles it.
+    if (isCalendarCreate && !row.priority) {
+      throw new Error(
+        'Set a priority for this event before approving — PATCH /api/proposed-changes/{id} with a "priority" first.'
+      );
+    }
+
     if (isCalendarCreate || row.change_type === 'move') {
       // Phase 3.5 item 30 — standing scheduling rules, checked before
       // conflict detection and independent of bump_if_movable (a rule

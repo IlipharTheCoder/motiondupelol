@@ -15,6 +15,16 @@ export interface FindFreeSlotsOptions {
   // category/tag-scoped rules need these to match.
   category?: BurnerEventType;
   tags?: string[];
+  // NL chat's find_free_time only (2026-07-25) — skips working-hours windows
+  // and scheduling_rules entirely, treating the whole requested range as one
+  // open window before subtracting real busy time. The user explicitly
+  // wants chat's free-time search unrestricted ("everything is fair game")
+  // and trusts the model's own judgment for what's a reasonable time to
+  // suggest, rather than a hard algorithmic filter. Every other caller
+  // (habits, Focus Time, auto-reschedule, day-rebalance, bump-relocation,
+  // GET /api/calendar/free-slots) never sets this — they keep placing things
+  // only in rule-compliant windows.
+  ignoreWorkingHoursAndRules?: boolean;
 }
 
 export interface FindFreeSlotsResult {
@@ -33,8 +43,14 @@ export async function findFreeSlots(
   }
 
   const config = options.config ?? getSchedulingConfig();
-  const rules = await fetchApplicableSchedulingRules(options.category, options.tags ?? []);
-  const windows = generateWorkingWindows(rangeStart, rangeEnd, config, rules);
+  const windows = options.ignoreWorkingHoursAndRules
+    ? [{ start: rangeStart.getTime(), end: rangeEnd.getTime() }]
+    : generateWorkingWindows(
+        rangeStart,
+        rangeEnd,
+        config,
+        await fetchApplicableSchedulingRules(options.category, options.tags ?? [])
+      );
 
   if (windows.length === 0) {
     return { slots: [], rangeStart: rangeStart.toISOString(), rangeEnd: rangeEnd.toISOString() };

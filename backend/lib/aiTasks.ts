@@ -122,6 +122,16 @@ export interface LinkTaskResult {
   proposal?: ProposedChangeRow;
 }
 
+export interface LinkTaskOptions {
+  // Forced true by the NL chat layer's dispatch (lib/nlToolDispatch.ts) so a
+  // chat-initiated link can never bypass manual review via
+  // AUTO_APPLY_CATEGORIES, regardless of its configuration — same guarantee
+  // propose_calendar_change already has. Defaults false/unset here so the
+  // direct API (POST /api/tasks/{id}/schedule) keeps its existing behavior
+  // for a human 'ai-engine'-actor caller.
+  skipAutoApply?: boolean;
+}
+
 // Ties a task to a calendar event that already exists (e.g. an existing
 // Focus Time block) — this is bookkeeping (which block is this task for),
 // not a scheduling decision: it doesn't create, move, or delete any
@@ -132,7 +142,8 @@ export interface LinkTaskResult {
 export async function linkTaskToExistingEvent(
   taskId: string,
   eventId: string,
-  actor: ScheduleTaskActor
+  actor: ScheduleTaskActor,
+  options: LinkTaskOptions = {}
 ): Promise<LinkTaskResult> {
   const task = await getTask(taskId);
   assertUnscheduled(task);
@@ -187,14 +198,17 @@ export async function linkTaskToExistingEvent(
   // effectively a placeholder here, since applyProposedChange's 'update'
   // branch always keeps the target event's own existing category
   // (existingMeta.type wins over row.category for anything already real).
-  const proposal = await createProposedChange({
-    change_type: 'update',
-    category: 'task',
-    source_system: 'ai-engine',
-    source_id: taskId,
-    target_event_id: eventId,
-    reason: `Link task "${task.title}" to an existing calendar event`,
-  });
+  const proposal = await createProposedChange(
+    {
+      change_type: 'update',
+      category: 'task',
+      source_system: 'ai-engine',
+      source_id: taskId,
+      target_event_id: eventId,
+      reason: `Link task "${task.title}" to an existing calendar event`,
+    },
+    { skipAutoApply: options.skipAutoApply }
+  );
 
   return { mode: 'linked-via-proposal', proposal };
 }
@@ -231,6 +245,16 @@ export interface CreateTaskEventResult {
   proposal: ProposedChangeRow;
 }
 
+export interface ScheduleTaskOptions {
+  // Same NL-chat-only guarantee as LinkTaskOptions.skipAutoApply above.
+  skipAutoApply?: boolean;
+  // Chat-created event proposals leave priority for you to set at review
+  // time (2026-07-25) rather than silently carrying over the task's own
+  // priority — false only for that path; the direct API keeps carrying it
+  // over by default.
+  carryOverPriority?: boolean;
+}
+
 // Gives a task a brand-new calendar block — this genuinely creates calendar
 // time, so unlike linking to something that already exists, this always
 // goes through the normal proposed_changes review queue regardless of who's
@@ -240,7 +264,8 @@ export async function scheduleTaskToNewEvent(
   proposedStart: string,
   proposedEnd: string,
   bumpIfMovable = false,
-  ignoreSchedulingRules = false
+  ignoreSchedulingRules = false,
+  options: ScheduleTaskOptions = {}
 ): Promise<CreateTaskEventResult> {
   const task = await getTask(taskId);
   assertUnscheduled(task);
@@ -252,23 +277,28 @@ export async function scheduleTaskToNewEvent(
     throw new ValidationError('"proposed_end" must be later than "proposed_start"');
   }
 
-  const proposal = await createProposedChange({
-    change_type: 'create',
-    category: 'task',
-    flexible: 'true',
-    priority: task.priority ?? 'medium',
-    source_system: 'ai-engine',
-    source_id: taskId,
-    proposed_summary: task.title,
-    proposed_description: task.description ?? undefined,
-    deadline: task.deadline ?? undefined,
-    duration_minutes: task.duration_minutes ?? undefined,
-    proposed_start: proposedStart,
-    proposed_end: proposedEnd,
-    bump_if_movable: bumpIfMovable,
-    ignore_scheduling_rules: ignoreSchedulingRules,
-    reason: `Schedule task "${task.title}" onto the calendar`,
-  });
+  const carryOverPriority = options.carryOverPriority ?? true;
+
+  const proposal = await createProposedChange(
+    {
+      change_type: 'create',
+      category: 'task',
+      flexible: 'true',
+      priority: carryOverPriority ? task.priority ?? 'medium' : undefined,
+      source_system: 'ai-engine',
+      source_id: taskId,
+      proposed_summary: task.title,
+      proposed_description: task.description ?? undefined,
+      deadline: task.deadline ?? undefined,
+      duration_minutes: task.duration_minutes ?? undefined,
+      proposed_start: proposedStart,
+      proposed_end: proposedEnd,
+      bump_if_movable: bumpIfMovable,
+      ignore_scheduling_rules: ignoreSchedulingRules,
+      reason: `Schedule task "${task.title}" onto the calendar`,
+    },
+    { skipAutoApply: options.skipAutoApply }
+  );
 
   return { mode: 'created-via-proposal', proposal };
 }
