@@ -250,6 +250,8 @@ synced_tasks
 - **`synced_tasks.source_updated_at`** is populated from Todoist's `created_at` field as a placeholder — the REST API v2 exposes no true last-modified timestamp, and this field isn't acted on yet anyway (see the "deliberately out of scope" note above).
 - **Closing the loop on task-backed calendar deletes:** when an approved/auto-applied `delete` proposal's `target_event_id` matches a `tasks.scheduled_event_id`, `applyProposedChange` marks that `tasks` row `completed` as a side effect (best-effort — a failure here doesn't turn an already-succeeded calendar delete into a `failed` proposal). Not explicitly speced above, but without it a task-backed event's deletion would leave `tasks.status` permanently stuck at `'scheduled'`.
 
+**Migrated to Todoist's unified `/api/v1` endpoint (2026-07-24) — the old `rest/v2` base this originally used was deprecated and started returning `410 Gone`.** Surfaced live by testing the new `POST /api/refresh` endpoint (see the "Sync cadence" resolution in section 7). Confirmed against a real token rather than guessed from docs: responses are now `{ results: [...], next_cursor }` (paginated — `fetchActiveTasks` now loops on `next_cursor` until exhausted, since the original "small personal list, one page is enough" assumption no longer holds now that pagination is explicit), `due.datetime` was folded into a single `due.date` field (a bare `"YYYY-MM-DD"` for all-day, or `"YYYY-MM-DDTHH:mm:ss"` — no explicit UTC offset, unlike the old field — when timed), and `created_at` was renamed `added_at`. Todoist's own migration notice states every task/object ID changes under the new API; confirmed there were zero existing `synced_tasks` rows for `source_system: 'todoist'` at migration time, so nothing needed reconciling — a future re-run of this migration against a populated table would need to treat every old row's `source_id` as permanently orphaned, not diffed against the new API's ids. Live-verified end-to-end post-fix: a real sync against the user's actual Todoist account proposed 39 intake proposals with zero errors, deadlines parsing correctly from the new `due.date` shape.
+
 ---
 
 ## 4b. AI Focus Time (implemented 2026-07-23)
@@ -314,6 +316,14 @@ Two distinct modes, both operating on an `unscheduled` `tasks` row (409 if the t
 
 **New route:** `POST /api/tasks/{id}/schedule` — body is either `{ actor, event_id }` (link) or `{ proposed_start, proposed_end }` (create new); exactly one shape, `400` otherwise. Implemented via `lib/aiTasks.ts`; no schema changes needed.
 
+**Multiple tasks per calendar block — confirmed as a deliberate, key feature (2026-07-24), not a bug to guard against.** Several small tasks batching into one Focus Time block is a real, intended use case. Turned out to need zero structural change to the linking flow itself: `tasks.scheduled_event_id` was already a plain many-to-one pointer (no uniqueness ever enforced), and nothing in `linkTaskToExistingEvent` checked whether the target event already had a different task pointing at it — so this "just worked" once confirmed as wanted rather than accidental. Two real gaps this surfaced, both closed in the same pass:
+- **No way to see what's on a block.** The event's own metadata (`extendedProperties.private.sourceId`) can only ever hold one task id — it silently reflects whichever task was linked most recently, orphaning any earlier link's pointer without touching that earlier task's own row (still correctly `scheduled_event_id: <event>`, just no longer reachable *from* the event). Not a bug introduced now — this was always true, just never mattered until N>1 tasks on one block became a real scenario. Fixed by adding a `scheduled_event_id` filter to `GET /api/tasks` (`backend-api-reference.md`) — the only reliable way to enumerate a block's tasks, since it queries the tasks' own rows rather than trusting the event's lossy single-value pointer.
+- **No way to remove one task from a shared block.** New `POST /api/tasks/{id}/unschedule` (`lib/aiTasks.ts`'s `unscheduleTask`) — sets the task back to `unscheduled`, clears `scheduled_event_id`, and deliberately never touches the calendar event itself (same bookkeeping-only principle as linking) — removing one task from a shared block must never affect the other tasks still on it, or delete a block someone might want to keep. If the event itself should go too, that's a separate, explicit delete through the normal review queue.
+
+**The event's title is deliberately never auto-managed on link or unlink** — confirmed after initially considering "overwrite the title with the task's name" for legibility: that only works for exactly one task and goes stale/misleading the moment a second joins a block, so it was dropped in favor of always querying `scheduled_event_id` for the real, current list rather than trusting title text.
+
+**Update (2026-07-25):** both new capabilities were briefly also added to the Phase 5 NL chat layer's tool surface (`list_tasks` gained an `event_id` filter; new `unschedule_task` tool), then removed again the same day when that tool surface was completely rebuilt down to exactly two abilities (`propose_calendar_change`, `find_free_time` — see the Phase 5 section below). Both capabilities above remain fully available through the direct API (`GET /api/tasks?scheduled_event_id=...`, `POST /api/tasks/{id}/unschedule`); they're just not reachable from chat anymore.
+
 ---
 
 ## 4e. AI Tasks — Part 2: automatic placement/sorting (implemented 2026-07-23)
@@ -354,6 +364,29 @@ Phase 3 item 8 — set recurring occurrence-count goals ("gym 3x/week," "read 1x
 
 ---
 
+## 4g. NL Chat Layer — current design (rebuilt 2026-07-25)
+
+Phase 5. Originally built (2026-07-24) as a ~31-tool surface covering nearly everything above — tasks, habits, scheduling rules, batch/group operations, bulk-edit, recurring series, relocate, reschedule/rebalance, focus/buffer/task/habit auto-placement, approve/reject/revert, an explicit data refresh, capability-gap logging, and progressive-disclosure reference docs. **Completely rebuilt the next day, per explicit user decision, down to exactly two abilities** — the original surface was too large for `claude-haiku-4-5` to reliably keep track of, and the fix wasn't trimming the least-used tools, it was resetting to the smallest useful surface:
+
+1. **`propose_calendar_change`** — create, move, or delete a calendar event, any category.
+2. **`find_free_time`** — read-only lookup of open time windows.
+
+Nothing else is reachable from chat anymore — not because it was removed as broken, but as a deliberate scope cut. Everything that used to be chat-reachable is still available through the direct API.
+
+**Structurally guaranteed to never apply anything without manual approval** — confirmed as the one non-negotiable requirement of the rebuild ("I need to manually press the endpoint"). This is enforced two ways, not just prompt instruction: there is no approve/reject/revert tool in the surface at all (the model literally cannot call one), and `propose_calendar_change` forces `skipAutoApply: true` on every call, bypassing `AUTO_APPLY_CATEGORIES` entirely for this path. Live-verified: with `AUTO_APPLY_CATEGORIES=personal` set, an identical `personal`-category proposal auto-applied immediately through the direct `POST /api/proposed-changes` call but stayed `pending` when created through chat — the same environment, the same category, two different outcomes depending on which path created it.
+
+**Move was confirmed in scope, update was not.** The user said "create/delete" specifically; asked directly, they confirmed move (rescheduling an existing event) should fold into the same tool as a natural extension, but field-level edits (renaming, re-describing without moving) stayed out — those aren't one of the two stated abilities.
+
+**Ambiguity is handled in plain text, not a tool.** No dedicated clarifying-question tool exists — if the model needs to ask something, it just does, in its normal reply, which naturally ends the loop with no tool_use blocks (the same path any final answer takes). This was a deliberate choice, confirmed with the user, over cutting clarifying behavior entirely.
+
+**Context was trimmed to match:** resolved time anchors and the 7-day calendar digest only. Open state (pending proposals/recent decisions), data freshness, and active scheduling rules were all dropped — none of them are actionable for a model that can only propose or search, and a rule violation or conflict already comes back as a descriptive error on the tool result itself. The calendar digest is now load-bearing in a way it wasn't before: it's the *only* source of existing event ids for a move/delete, since there's no dedicated lookup tool — an event more than 7 days out can't be referenced by name, and the model is instructed to say so rather than guess an id.
+
+**A real, honest tradeoff surfaced by the rebuild, not hidden:** prompt caching, which meaningfully paid off at the prior ~6.7k-token tool-heavy prefix, no longer triggers at all — the new stable prefix is ~1,576 tokens, live-verified too small to write or read from cache on any test call. The `cache_control` breakpoint is left in place (harmless, and would start working again if the surface ever grows) but isn't providing any benefit today. This is an accepted cost of the simplification, not an oversight.
+
+See `backend-build-order.md`'s rebuild entry for the full live-verification record (create/move/delete, find-free-time, the auto-apply bypass proof, and the digest-boundary behavior all tested against the real calendar).
+
+---
+
 ## 5. Calendly-style Scheduler (Vercel, free hosting)
 
 This is the piece your notes correctly identified needs its own public web presence — a stranger booking time with you can't go through your native app.
@@ -391,7 +424,7 @@ Every backend route except `/api/health` checks for a shared secret via an `isAu
 
 ## 7. Open questions before you start building
 
-- **Sync cadence** — is a 10–15 min cron loop tight enough, or do you want Google Calendar push notifications (webhooks) for near-real-time updates when something changes? (Push is more responsive but more setup; cron is simpler and probably fine for a personal tool.)
+- ~~**Sync cadence**~~ — resolved (2026-07-24): **app-triggered only, no cron.** Vercel Cron on the Hobby tier only guarantees once-per-day invocation (timing fuzzy within the scheduled hour, not exact-minute) — nowhere near the 10–15 min cadence originally proposed here, and not worth the added auth/config surface (a separate `CRON_SECRET`-checked route) for a once-a-day guarantee alone, given a personal tool's app is realistically opened multiple times a day anyway. `POST /api/refresh` (new, `backend-api-reference.md`) is the single call the app makes on launch/foreground/pull-to-refresh — it fans out to `POST /api/calendar/sync` + `POST /api/todoist/sync` in parallel, each isolated so one source's failure doesn't block the other. Revisit only if calendar staleness while the app is closed turns out to matter in practice — the two options considered and rejected were a daily-only cron safety net (marginal value on top of app-triggered) and upgrading to Vercel Pro for real sub-daily cron (real cost for a still-personal, single-user tool).
 - ~~**Approval UX**~~ — resolved (Phase 2 item 4): `AUTO_APPLY_CATEGORIES` env var whitelists categories to auto-apply immediately; everything else sits `pending` for a tap.
 - **Inbox triage UI** — does the parsed screenshot text get a dedicated review screen, or does it just appear inline wherever proposed calendar changes show up?
 - ~~**Color-tag scheme**~~ — resolved for the app-side metadata tag: `colorTag` is always derived from `type` via a fixed hex-color map (`lib/eventMetadata.ts`'s `CATEGORY_COLORS`), never freely chosen. Still open: whether to *also* set Google's native `colorId` so the color shows up inside Google Calendar's own UI, not just the app's — not needed for anything built so far.

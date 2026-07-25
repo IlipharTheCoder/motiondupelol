@@ -1,15 +1,15 @@
 # Project: AI Calendar Manager — Backend
 
 ## What this is
-The backend for a personal AI calendar manager. Holds all real logic and all sensitive credentials. The Mac/iOS client (separate Xcode project) is a thin display/approval layer that only talks to this backend's API — it has no Google or Claude credentials of its own.
+The backend for a personal AI calendar manager. Holds all real logic and all sensitive credentials. The Mac/iOS client (`../app/motiondupelol/`, a sibling directory in this same workspace as of 2026-07-25 — separate Xcode project, own `CLAUDE.md`) is a thin display/approval layer that only talks to this backend's API — it has no Google or Claude credentials of its own.
 
 Full system design: `architecture-plan.md`
 Build order / what's next: `backend-build-order.md`
 Current API surface: `backend-api-reference.md`
 Current database schema: `backend-schema.md`
-Guiding principles + building blocks for the Xcode client: `app-development-guide.md` (synthesizes the three docs above for app-side work)
+Guiding principles + building blocks for the Xcode client: `app-development-guide.md` (synthesizes the three docs above for app-side work — this is the canonical copy; do not duplicate these four docs into the app project directory, they will drift. A prior duplicated set in `../app/motiondupelol/` was found stale and deleted 2026-07-25.)
 
-**Read the relevant doc above before starting a task** — don't infer architecture decisions from scratch when they're already written down. (Note: these docs live at the repo root, not under a `docs/` directory — there is no `docs/` folder in this repo. An `ai-calendar-manager-spec.md` file was referenced by early planning but was never actually added to the repo; `backend-build-order.md` now carries the equivalent per-item detail inline instead, including a `table #N` cross-reference in each item pointing at where that classification would have lived. The one exception is `nl-reference/` — a small root-level subdirectory, same tier as `lib/`/`app/`, holding longer-form reference docs the Phase 5 chat layer's `read_reference` tool fetches on demand; this is not the forbidden `docs/` pattern, just a normal subdirectory.)
+**Read the relevant doc above before starting a task** — don't infer architecture decisions from scratch when they're already written down. (Note: these docs live at the repo root, not under a `docs/` directory — there is no `docs/` folder in this repo, and the same is true of the sibling app project. An `ai-calendar-manager-spec.md` file was referenced by early planning but was never actually added to the repo; `backend-build-order.md` now carries the equivalent per-item detail inline instead, including a `table #N` cross-reference in each item pointing at where that classification would have lived. A `nl-reference/` subdirectory referenced here previously was deleted 2026-07-25 along with the `read_reference` tool it served, when the NL chat layer was rebuilt down to two abilities — see `backend-build-order.md`'s rebuild entry.)
 
 ## Stack
 - Next.js (App Router), TypeScript, deployed on Vercel (Hobby/free tier)

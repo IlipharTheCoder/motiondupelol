@@ -1,8 +1,7 @@
 import { describe, expect, it } from 'vitest';
-import { formatTimeAnchors, formatCalendarDigest, formatOpenState } from './nlContext';
+import { formatTimeAnchors, formatCalendarDigest } from './nlContext';
 import type { SchedulingConfig } from './schedulingConfig';
 import type { CalendarEventSummary } from './calendarEvents';
-import type { ProposedChangeRow } from './proposedChanges';
 
 const config: SchedulingConfig = {
   homeTimezone: 'America/New_York',
@@ -58,56 +57,5 @@ describe('formatCalendarDigest', () => {
     expect(output).toContain('Dentist');
     expect(output).toContain('2026-08-06T14:00:00-04:00');
     expect(output).toContain('[health]');
-  });
-});
-
-describe('formatOpenState', () => {
-  const baseProposal: ProposedChangeRow = {
-    id: 'p1',
-    change_type: 'move',
-    category: 'meeting',
-    source_system: 'ai-engine',
-    status: 'pending',
-    decided_by: null,
-    decided_at: null,
-    applied_at: null,
-    error_message: null,
-    previous_state: null,
-    proposal_group_id: null,
-    color_tag: '#F4511E',
-    created_at: '2026-08-06T18:00:00Z',
-    updated_at: '2026-08-06T18:00:00Z',
-    proposed_summary: 'Standup',
-    target_event_id: 'evt1',
-  };
-
-  it('reports no pending proposals plainly', () => {
-    const output = formatOpenState([], [], []);
-    expect(output).toBe('No pending proposals.');
-  });
-
-  it('lists pending proposals, groups, and recent actions', () => {
-    const output = formatOpenState(
-      [baseProposal],
-      ['group-1'],
-      [
-        {
-          id: 'p0',
-          change_type: 'move',
-          category: 'meeting',
-          summary: 'Old standup',
-          status: 'applied',
-          decided_at: '2026-08-06T17:00:00Z',
-        },
-      ]
-    );
-
-    expect(output).toContain('Pending proposals (1)');
-    expect(output).toContain('p1');
-    expect(output).toContain('Standup');
-    expect(output).toContain('Pending proposal groups: group-1');
-    expect(output).toContain('Recently decided');
-    expect(output).toContain('p0');
-    expect(output).toContain('applied');
   });
 });

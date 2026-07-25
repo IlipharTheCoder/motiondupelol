@@ -245,7 +245,7 @@ Phase 3 item 6 (Todoist task sync, `architecture-plan.md` section 4a) — a data
 | `source_system` | `text` | `'todoist'` / `'canvas'` / `'manual'` |
 | `source_id` | `text` | The source system's own task id (e.g. Todoist's task id) |
 | `status` | `text` | `'unscheduled'` / `'scheduled'` / `'completed'` / `'discarded'` |
-| `scheduled_event_id` | `text` | Burner calendar event id, once AI Tasks (Part 1's manual link/create, or Part 2's auto-placement) gives it an actual time slot. `null` until then |
+| `scheduled_event_id` | `text` | Burner calendar event id, once AI Tasks (Part 1's manual link/create, or Part 2's auto-placement) gives it an actual time slot. `null` until then. **Many-to-one, never unique** (confirmed 2026-07-24) — multiple tasks can share one event id (e.g. several small tasks batched into one Focus Time block); `GET /api/tasks?scheduled_event_id=...` is the reliable way to enumerate everything on a given block, since the event's own metadata can only hold one task id at a time (see `POST /api/tasks/{id}/schedule` in `backend-api-reference.md`) |
 | `created_at` | `timestamptz` | Default `now()` |
 | `updated_at` | `timestamptz` | Default `now()` |
 

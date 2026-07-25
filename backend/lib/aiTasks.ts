@@ -199,6 +199,33 @@ export async function linkTaskToExistingEvent(
   return { mode: 'linked-via-proposal', proposal };
 }
 
+// Detaches a task from its calendar block — the inverse of
+// linkTaskToExistingEvent, same "bookkeeping, not a scheduling decision"
+// principle: never touches the calendar event itself, even if that event
+// was originally created just for this task (scheduleTaskToNewEvent).
+// Auto-deleting or otherwise modifying the event on unschedule would be a
+// real destructive side effect on calendar state the task's own removal
+// doesn't obviously justify — if the leftover event should actually go too,
+// that's a separate, explicit delete through the normal proposed_changes
+// review queue. Symmetric requirement to linking's own assertUnscheduled:
+// only a 'scheduled' task can be unscheduled.
+export async function unscheduleTask(taskId: string): Promise<TaskRow> {
+  const task = await getTask(taskId);
+  if (task.status !== 'scheduled') {
+    throw new ConflictError(`Task "${task.title}" is "${task.status}", not "scheduled" — nothing to unschedule`);
+  }
+
+  const { data, error } = await supabase
+    .from('tasks')
+    .update({ status: 'unscheduled', scheduled_event_id: null })
+    .eq('id', taskId)
+    .select('*')
+    .single();
+  if (error) throw new Error(`tasks update failed: ${error.message}`);
+
+  return data as TaskRow;
+}
+
 export interface CreateTaskEventResult {
   mode: 'created-via-proposal';
   proposal: ProposedChangeRow;

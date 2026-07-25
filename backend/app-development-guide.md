@@ -35,12 +35,14 @@ This is the one idea that shapes almost every screen the app will need.
 
 ---
 
-## 3. Two front doors, same underlying primitives
+## 3. Two front doors — chat is now deliberately narrow
 
-The app can drive the backend two ways, and they produce **identical** results — the review queue doesn't know or care which one created a row:
+The app can drive the backend two ways, but they are **not** symmetric anymore (rebuilt 2026-07-25):
 
-1. **Direct structured calls** — the app's own UI (a "new task" form, a "propose a move" gesture, a settings screen for scheduling rules) calls the specific REST endpoint for that action.
-2. **`POST /api/chat`** — free text in, and the backend runs an agentic loop (`claude-haiku-4-5`, capped at 6 tool-calling iterations) that maps the request onto the same ~31 tools/endpoints Section 5 lists. A chat-originated proposal is a completely ordinary `proposed_changes` row — the review-queue screen doesn't need a special code path for it.
+1. **Direct structured calls** — the app's own UI (a "new task" form, a "propose a move" gesture, a settings screen for scheduling rules) calls the specific REST endpoint for that action. This covers the full API surface in Section 5.
+2. **`POST /api/chat`** — free text in, but the model has exactly **two abilities**: propose a calendar change (create/move/delete), and find free time. Nothing else — no tasks, habits, scheduling rules, bulk operations, or approvals. This was a deliberate simplification (the prior ~31-tool surface was too large for `claude-haiku-4-5` to reliably track) — chat is now a narrow, reliable calendar-request assistant, not a full alternate interface to everything in Section 5. A chat-originated proposal is still a completely ordinary `proposed_changes` row (the review-queue screen doesn't need a special code path for it) — it's the *tool surface* that shrank, not the underlying write path.
+
+**Nothing from chat can ever apply itself — this is structural, not a prompt instruction.** There is no approve/reject tool in chat's surface at all, and every proposal it creates forces a bypass of `AUTO_APPLY_CATEGORIES` (live-verified: an identical category that auto-applies through the direct API stays `pending` when created through chat). Every chat-created proposal needs the same manual approval tap through the app as anything else — always, not a v1 posture that might later change.
 
 **Chat request/response shape** (`backend-api-reference.md`'s `POST /api/chat`):
 ```json
@@ -51,12 +53,15 @@ The app can drive the backend two ways, and they produce **identical** results �
 {
   "conversation_id": "uuid",
   "reply": "string",
-  "proposals": [ /* ProposedChangeRow[] created this turn */ ],
-  "group_id": "string (optional)",
-  "clarification": "string (optional) — present only if the model asked a clarifying question instead of acting"
+  "proposals": [ /* ProposedChangeRow[] created this turn, if any */ ],
+  "usage": { "inputTokens": 0, "outputTokens": 0, "cacheCreation5mTokens": 0, "cacheCreation1hTokens": 0, "cacheReadTokens": 0, "estimatedCostUsd": 0 }
 }
 ```
-An unrecognized/stale `conversation_id` silently starts a fresh conversation rather than erroring — safe for the app to always send whatever id it last cached, even across app restarts or a backend redeploy. **Nothing from chat auto-applies** (confirmed v1 posture) — every chat-created proposal needs the same review-queue tap as anything else, regardless of how directly the user phrased the request.
+An unrecognized/stale `conversation_id` silently starts a fresh conversation rather than erroring — safe for the app to always send whatever id it last cached, even across app restarts or a backend redeploy. There's no `group_id`/`clarification` field anymore — no tool produces a group, and ambiguity is just handled in the model's plain-text reply.
+
+**`usage`** is on every response. `estimatedCostUsd` is a live estimate computed from the actual token counts against Anthropic's published per-token/cache-multiplier rates, not a billed total — good enough for an in-app "this conversation cost ~$0.003" indicator, not for financial reconciliation. If you want a running per-conversation total, sum it client-side across calls sharing a `conversation_id` — the backend doesn't persist or aggregate it anywhere today (only final message text is stored, see Section 4). Note: with only 2 tools, the stable prompt prefix is now small enough (~1,576 tokens) that prompt caching doesn't actually trigger — `cacheCreation*Tokens`/`cacheReadTokens` will be `0` on every call, live-verified, not a bug.
+
+**If you need chat to reach beyond these two abilities** (e.g. "create a task," "set up a recurring series"), that's out of scope for `/api/chat` now — build a direct UI action against the relevant endpoint in Section 5 instead.
 
 ---
 
@@ -82,7 +87,7 @@ The app will render this constantly (approve/reject screens, chat responses' `pr
 
 ### Tasks, Habits, Scheduling Rules, Capability Requests
 Each is its own small table, independent of calendar events until explicitly scheduled/placed:
-- **`tasks`** — one-off items with a single `deadline`. `status`: `unscheduled → scheduled → completed/discarded`. `scheduled_event_id` links to the calendar event once placed.
+- **`tasks`** — one-off items with a single `deadline`. `status`: `unscheduled → scheduled → completed/discarded`. `scheduled_event_id` links to the calendar event once placed — **many-to-one, not unique**: multiple tasks can share one block (e.g. several small tasks batched into one Focus Time slot). Query `GET /api/tasks?scheduled_event_id=...` to see everything attached to a given block; don't rely on the event's own title or metadata to tell you, since the event can only ever reflect one task's id and its title is never auto-managed.
 - **`habits`** — recurring occurrence-count goals ("gym 3x/week"). `status`: `active`/`paused`. `cadence`: `weekly`/`monthly`/`daily`/`interval`.
 - **`scheduling_rules`** — standing time-of-day/weekday constraints ("never before 9am on weekdays"), scoped to a category, a tag, or global. `active`: boolean, no delete.
 - **`capability_requests`** — the backlog of "asked for X, nothing covers it," mostly populated by the chat layer's `log_capability_gap` fallback. `status`: `open → planned → built/wontfix`. Worth its own small triage screen if you want visibility into what the NL layer keeps failing to do.
@@ -101,14 +106,15 @@ Grouped by what a screen would call it for. Full request/response shapes are in 
 | **Calendar view** | `GET /api/calendar/events`, `GET /api/calendar/free-slots`, `GET /api/calendar/conflicts` | Render the calendar, check availability, diagnose an overlap |
 | **Review queue** | `GET/POST /api/proposed-changes`, `POST .../{id}/approve\|reject\|revert`, `PATCH /api/proposed-changes/{id}`, `POST /api/proposed-changes/batch`, `POST .../batch/{groupId}/approve\|reject` | The central approve/reject screen — single rows and groups |
 | **Direct calendar actions** | `POST /api/calendar/events/{id}/relocate`, `POST /api/calendar/bulk-edit`, `POST /api/calendar/recurring`, `POST /api/calendar/reschedule`, `POST /api/calendar/rebalance` | "Move this," "edit all matching X," "set up a recurring series," conflict/overload cleanup — all produce ordinary proposals |
-| **Tasks** | `GET/POST /api/tasks`, `POST /api/tasks/{id}/schedule`, `GET /api/tasks/next`, `POST /api/tasks/plan` | Task list CRUD, giving a task a calendar slot (manually or auto), "what should I work on next" |
+| **Tasks** | `GET/POST /api/tasks`, `POST /api/tasks/{id}/schedule`, `POST /api/tasks/{id}/unschedule`, `GET /api/tasks/next`, `POST /api/tasks/plan` | Task list CRUD, giving a task a calendar slot (manually or auto) or detaching it again, "what should I work on next" |
 | **Habits** | `GET/POST /api/habits`, `PATCH /api/habits/{id}`, `POST /api/habits/plan` | Habit CRUD (create/pause/resume), the occurrence-placement engine |
 | **Focus Time** | `POST /api/focus-time/plan`, `GET /api/focus-time/stats`, `POST /api/focus-time/suggest` | Weekly deep-work goal auto-fill, the Deep Work Index stat, on-demand "find me a block" |
 | **Buffer Time** | `POST /api/buffer-time/plan` | Travel/prep/follow-up padding around existing events |
 | **Scheduling Rules** | `GET/POST /api/scheduling-rules`, `PATCH /api/scheduling-rules/{id}` | The standing-constraints settings screen |
 | **Capability backlog** | `GET/POST /api/capability-requests`, `PATCH /api/capability-requests/{id}` | Triage view for gaps the NL layer surfaced |
 | **Chat** | `POST /api/chat` | The conversational front door — see Section 3 |
-| **Sync (background/manual trigger)** | `POST /api/calendar/sync`, `POST /api/calendar/sync/dedupe`, `POST /api/todoist/sync` | Pull external calendars/Todoist in — nothing runs on a schedule yet, so a "sync now" affordance (or the app calling this on launch/refresh) is how these actually fire |
+| **Refresh** | `POST /api/refresh` | **Call this on launch, on foreground, and for pull-to-refresh.** Fans out to calendar + Todoist sync in parallel, one round trip, one combined response — this is the app's primary "get fresh data" call (see Section 7 below for why there's no background cron). App-only — not reachable from chat (removed in the 2026-07-25 rebuild, see Section 3) |
+| **Sync (individual, lower-level)** | `POST /api/calendar/sync`, `POST /api/calendar/sync/dedupe`, `POST /api/todoist/sync` | The individual syncs `POST /api/refresh` wraps — call these directly only if you need to retry/observe one source in isolation (e.g. a dedicated "resync calendars only" debug action) |
 | **Inbox (legacy/lower priority)** | `GET/POST /api/inbox`, `PATCH /api/inbox/{id}` | Plain-text quick capture; the screenshot-parsing half (`POST /api/capture`) is **not implemented** — don't build a screenshot-clipper UI against it yet |
 
 ---
@@ -121,7 +127,7 @@ Grouped by what a screen would call it for. Full request/response shapes are in 
 - **Range params:** every range-taking endpoint uses explicit `from`/`to` ISO timestamps — there's no `today`/`tomorrow`/`this week` shorthand anywhere in the API. If you want "Today" or "This Week" buttons, compute the matching `from`/`to` in the app before calling.
 - **Tags:** always lowercase, trimmed, deduped — the backend normalizes on write (`normalizeTags()`), but don't rely on that to clean up a mixed-case display list; treat tags as case-insensitive in the app's own UI too.
 - **Casing gotcha to know about:** database-row responses (`proposed_changes`, `scheduling_rules`, `tasks`, `habits`) are snake_case throughout, even in JSON responses. Purpose-built summary objects (bulk-edit, batch, recurring-series, relocate results) are camelCase at the top level — and bulk-edit's own result is a mixed case, camelCase on top with a snake_case nested `filters` echo. Don't assume one convention across the whole API surface.
-- **Polling, not push:** nothing in this backend runs on a schedule (no cron, no webhooks) as of this writing. If the app wants "fresh" data, it calls the relevant `GET`/sync endpoint itself — pull-to-refresh, not a live feed.
+- **Polling, not push, by deliberate choice:** nothing in this backend runs on a schedule (no cron, no webhooks) — resolved, not just unbuilt (`architecture-plan.md` §7). Vercel Hobby-tier cron only guarantees once-per-day, fuzzy within the hour — not worth the added complexity over just having the app call `POST /api/refresh` itself (launch/foreground/pull-to-refresh). **This means calendar/task freshness is entirely a function of how often the app is opened** — there's no background sync happening while it's closed. Design the app's refresh triggers accordingly, and don't assume data is fresher than "as of the last time this app was foregrounded."
 
 ---
 

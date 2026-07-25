@@ -1,11 +1,24 @@
 import { supabase } from './supabase';
 import { createProposedChange } from './proposedChanges';
 
-const TODOIST_API_BASE = 'https://api.todoist.com/rest/v2';
+// Migrated 2026-07-24 — the old rest/v2 base this pointed at was deprecated
+// (410, "endpoint is deprecated... use /api/v1/") and replaced by Todoist's
+// unified API. Confirmed live against a real token rather than guessed from
+// docs: responses are now `{ results: [...], next_cursor }` (paginated, not
+// a flat array), `due.datetime` was folded into `due.date` (a bare
+// "YYYY-MM-DD" for all-day, or "YYYY-MM-DDTHH:mm:ss" — no explicit UTC
+// offset — when timed), and `created_at` was renamed `added_at`. Todoist's
+// own migration notice also states every task/object ID changes under the
+// new API — confirmed there were zero existing `synced_tasks` rows for
+// `source_system: 'todoist'` at migration time, so there was nothing stale
+// to reconcile; if this ever needs re-running against a populated table,
+// the old rows' `source_id`s are guaranteed not to match anything the new
+// API returns and should be treated as orphaned, not diffed against.
+const TODOIST_API_BASE = 'https://api.todoist.com/api/v1';
 
 interface TodoistDue {
-  date: string;
-  datetime?: string;
+  date: string; // "YYYY-MM-DD" (all-day) or "YYYY-MM-DDTHH:mm:ss" (timed, no offset) — see todoistDeadline
+  timezone: string | null;
 }
 
 interface TodoistDuration {
@@ -19,7 +32,14 @@ interface TodoistTask {
   description: string;
   due: TodoistDue | null;
   duration: TodoistDuration | null;
-  created_at: string;
+  added_at: string;
+  checked: boolean;
+  is_deleted: boolean;
+}
+
+interface TodoistTasksPage {
+  results: TodoistTask[];
+  next_cursor: string | null;
 }
 
 interface SyncedTaskRow {
@@ -38,13 +58,17 @@ export interface TodoistSyncResult {
   errors: string[];
 }
 
-// A bare `due.date` (no `due.datetime`) is an all-day due date with no
-// attached time — treated as "must be done by end of that day" since
+// A bare `due.date` (just "YYYY-MM-DD", no "T") is an all-day due date with
+// no attached time — treated as "must be done by end of that day" since
 // `deadline` is a constraint, not a scheduled slot (nothing reads it yet
 // beyond store-and-round-trip — see backend-schema.md's proposed_changes).
+// The timed case ("YYYY-MM-DDTHH:mm:ss") carries no explicit UTC offset
+// under the new API (unlike v2's `due.datetime`, which always had one) —
+// `due.timezone` has the user's zone when set, but isn't reconciled here;
+// not worth the complexity while deadline stays store-and-round-trip only.
 function todoistDeadline(due: TodoistDue | null): string | undefined {
   if (!due) return undefined;
-  if (due.datetime) return due.datetime;
+  if (due.date.includes('T')) return due.date;
   return `${due.date}T23:59:59Z`;
 }
 
@@ -61,13 +85,26 @@ async function fetchActiveTasks(): Promise<TodoistTask[]> {
   const token = process.env.TODOIST_API_TOKEN;
   if (!token) throw new Error('TODOIST_API_TOKEN is not set');
 
-  const res = await fetch(`${TODOIST_API_BASE}/tasks`, {
-    headers: { Authorization: `Bearer ${token}` },
-  });
-  if (!res.ok) {
-    throw new Error(`Todoist API error ${res.status}: ${await res.text()}`);
-  }
-  return res.json();
+  const tasks: TodoistTask[] = [];
+  let cursor: string | null = null;
+
+  do {
+    const url = new URL(`${TODOIST_API_BASE}/tasks`);
+    if (cursor) url.searchParams.set('cursor', cursor);
+
+    const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+    if (!res.ok) {
+      throw new Error(`Todoist API error ${res.status}: ${await res.text()}`);
+    }
+    const page = (await res.json()) as TodoistTasksPage;
+    tasks.push(...page.results);
+    cursor = page.next_cursor;
+  } while (cursor);
+
+  // Defensive: completed/deleted tasks weren't observed in the default
+  // listing during migration testing, but filtering explicitly costs
+  // nothing and doesn't depend on that default staying stable.
+  return tasks.filter((t) => !t.checked && !t.is_deleted);
 }
 
 // Full-list diff against `synced_tasks`, not an incremental sync token — a
@@ -124,7 +161,7 @@ export async function runTodoistSync(): Promise<TodoistSyncResult> {
           source_id: task.id,
           proposed_change_id: proposal.id,
           task_id: null,
-          source_updated_at: task.created_at ?? null,
+          source_updated_at: task.added_at ?? null,
         },
         { onConflict: 'source_system,source_id' }
       );

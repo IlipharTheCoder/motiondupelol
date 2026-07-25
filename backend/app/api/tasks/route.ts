@@ -11,9 +11,10 @@ export async function GET(request: Request) {
 
   const { searchParams } = new URL(request.url);
   const status = searchParams.get('status');
+  const scheduledEventId = searchParams.get('scheduled_event_id');
 
   try {
-    const rows = await listTasks((status as TaskRow['status']) ?? undefined);
+    const rows = await listTasks((status as TaskRow['status']) ?? undefined, scheduledEventId ?? undefined);
     return Response.json(rows);
   } catch (error) {
     if (error instanceof ValidationError) {

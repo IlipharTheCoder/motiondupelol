@@ -815,6 +815,8 @@ A per-item `reason` wins over the batch-level `reason` if both are given; the ba
 
 Same on-demand-only shape as `POST /api/calendar/sync` — nothing in this backend runs on a schedule yet.
 
+**Migrated to Todoist's `/api/v1` unified API (2026-07-24)** — the old `rest/v2` base was deprecated and started returning `410`. See `architecture-plan.md` section 4a for the full migration details (pagination via `next_cursor`, the `due.date` shape change, `created_at` → `added_at`). Behavior and this response shape are unchanged; only the internal implementation (`lib/todoistSync.ts`) moved.
+
 **Response:**
 ```json
 {
@@ -827,6 +829,34 @@ Same on-demand-only shape as `POST /api/calendar/sync` — nothing in this backe
 ```
 
 **Errors:** `401` unauthorized, `500` if `TODOIST_API_TOKEN` is unset, the Todoist API call fails, or on an unexpected/Supabase failure
+
+---
+
+## `POST /api/refresh`
+
+**Auth:** required — same as above
+
+**Request:** no body
+
+**What it does:** the single "get me fresh data" entry point for a client (Section 7 of `architecture-plan.md` — resolved 2026-07-24: app-triggered refresh, not cron, is this backend's sync-cadence model). Fans out to `POST /api/calendar/sync` and `POST /api/todoist/sync` **in parallel** via their underlying `lib/calendarSync.ts`'s `runSync()` and `lib/todoistSync.ts`'s `runTodoistSync()` — not an HTTP self-call, a direct in-process call to each. Each source's failure is caught independently (same "one thing failing doesn't block the rest" principle as every other fan-out in this backend) — a Todoist outage doesn't prevent the calendar sync from running, or vice versa, and each source's own result/error is reported separately rather than failing the whole request.
+
+The fan-out logic lives in `lib/refresh.ts`'s `runRefresh()`, called by this route. **No longer reachable from chat** (removed 2026-07-25, in the NL chat layer's complete rebuild down to exactly two abilities — `propose_calendar_change` and `find_free_time` — see `POST /api/chat`) — a chat-triggered refresh was cut along with everything else outside those two abilities. The app itself is the only caller now; see `app-development-guide.md` for when to call it (launch/foreground/pull-to-refresh).
+
+**Canvas sync is deliberately not included** — it's on hiatus pending API access (see `POST /api/canvas/sync` below) and would just always fail today. Add it here once `CANVAS_API_TOKEN`/`CANVAS_BASE_URL` are real.
+
+**Response:**
+```json
+{
+  "startedAt": "ISO datetime",
+  "finishedAt": "ISO datetime",
+  "durationMs": 0,
+  "calendar": "SyncRunResult (see POST /api/calendar/sync) | { \"error\": \"string\" }",
+  "todoist": "TodoistSyncResult (see POST /api/todoist/sync) | { \"error\": \"string\" }"
+}
+```
+A `500` is only possible for something outside either sync's own error handling (e.g. this route itself throwing before either call runs) — a real per-source failure (bad token, Google API down, etc.) shows up as `{ "error": "..." }` in that source's own field, `200` overall, same "a component failing doesn't fail the whole request" shape as `POST /api/calendar/sync`.
+
+**Errors:** `401` unauthorized, `500` only on a failure outside both sync calls' own error handling
 
 ---
 
@@ -858,9 +888,9 @@ Same on-demand-only shape as `POST /api/todoist/sync` — nothing in this backen
 
 **Auth:** required — same as above
 
-**Query params:** `status` (optional — one of `unscheduled`/`scheduled`/`completed`/`discarded`; omit to return all rows)
+**Query params:** `status` (optional — one of `unscheduled`/`scheduled`/`completed`/`discarded`; omit to return all rows) · `scheduled_event_id` (optional, added 2026-07-24 — return only tasks attached to this calendar event; see `POST /api/tasks/{id}/schedule` below, multiple tasks can share one event)
 
-**What it does:** lists rows from `tasks` (`backend-schema.md`), newest first — the task list produced by approving Todoist (or future Canvas/manual) intake proposals.
+**What it does:** lists rows from `tasks` (`backend-schema.md`), newest first — the task list produced by approving Todoist (or future Canvas/manual) intake proposals. `scheduled_event_id` is the only reliable way to answer "what's attached to this calendar block" — the event's own metadata (`extendedProperties.private.sourceId`) can only ever hold one task id and reflects whichever task was linked most recently, not the full set once more than one task shares a block.
 
 **Response:** array of `tasks` rows
 
@@ -912,12 +942,30 @@ Providing both or neither shape is a `400`.
 
 Either way, the task must currently be `status: 'unscheduled'` — already-scheduled/completed/discarded tasks are a `409`.
 
+**Multiple tasks can be linked to the same event (added 2026-07-24)** — e.g. several small tasks batched into one Focus Time block. Nothing here checks whether `event_id` already has another task pointing at it, and nothing needs to: `tasks.scheduled_event_id` is a plain many-to-one pointer, never enforced unique. **Linking never touches the event's own title** (deliberate — see `GET /api/tasks`'s `scheduled_event_id` filter above for how to actually enumerate what's on a block; a title can only ever reflect one task's name and would go stale/misleading the moment a second task joins). Use `GET /api/tasks?scheduled_event_id=...` to see everything currently attached to a given block.
+
 **Response:**
 - Direct link (`actor: 'user'`): `{ "mode": "linked-directly", "task": { ...updated tasks row... } }`
 - Proposed link (`actor: 'ai-engine'`): `{ "mode": "linked-via-proposal", "proposal": { ...proposed_changes row... } }`
 - New event: `{ "mode": "created-via-proposal", "proposal": { ...proposed_changes row... } }`
 
 **Errors:** `401` unauthorized, `400` on a malformed body/dates or an invalid `actor`, `404` if the task or (for a direct link) the target event doesn't exist, `409` if the task isn't `unscheduled`, `500` on a Google API or Supabase failure
+
+---
+
+## `POST /api/tasks/{id}/unschedule`
+
+**Auth:** required — same as above
+
+**Request:** no body
+
+**What it does:** the inverse of `POST /api/tasks/{id}/schedule` — detaches a task from its calendar block: `status` goes back to `'unscheduled'`, `scheduled_event_id` is cleared to `null`. Same "bookkeeping, not a scheduling decision" principle as linking itself: **this never touches or deletes the calendar event**, even if that event was originally created just for this task via the `proposed_start`/`proposed_end` shape above. Auto-deleting calendar state as a side effect of a task-table change would be a real destructive action this endpoint doesn't try to justify on your behalf — if the now-possibly-orphaned event should also go, that's a separate, explicit `delete` through the normal `proposed_changes` review queue. If other tasks are still linked to the same event, they're completely unaffected — only the one task named in the URL changes.
+
+**What it does not check:** whether this was the task currently reflected in the event's own `sourceId` metadata (only ever "whichever task linked most recently" once multiple tasks share a block, see `GET /api/tasks` above) — the event's metadata is never touched either way.
+
+**Response:** the updated `tasks` row (`status: 'unscheduled'`, `scheduled_event_id: null`)
+
+**Errors:** `401` unauthorized, `404` if no task matches `id`, `409` if the task's `status` isn't `'scheduled'` (nothing to unschedule), `500` on a Supabase failure
 
 ---
 
@@ -1169,9 +1217,15 @@ A task too big for any single opening anywhere in the window is skipped with a r
 ```
 An unrecognized/stale `conversation_id` is treated as "start fresh" (a new conversation is created) rather than a `404` — a thin client re-sending a locally-cached id shouldn't hard-fail the chat.
 
-**What it does:** Phase 5 — the NL chat layer. Runs a manual agentic tool-calling loop (`lib/nlLoop.ts`, model `claude-haiku-4-5`, capped at 6 iterations) against Claude with ~31 tools (`lib/nlToolManifest.ts`) mapped onto this backend's existing capabilities (`lib/nlToolDispatch.ts`) — calendar reads, `proposed_changes` writes/decisions, task/habit/scheduling-rule declarations, and the various planning engines (bulk-edit, recurring series, relocate, reschedule/rebalance, focus/buffer/task/habit auto-placement). Every calendar-affecting tool still goes through the ordinary `proposed_changes` review queue — **the chat layer is a new caller, not a new write path**. Conversation history is lightweight and text-only (`chat_conversations`/`chat_messages`, `backend-schema.md`) — only final user/assistant text is persisted, never intermediate tool calls; "open state" (pending proposals/groups, recent decisions), the calendar digest, resolved time anchors, and active scheduling rules are recomputed fresh from the live tables on every single call, never replayed from history.
+**What it does:** Phase 5 — the NL chat layer. **Completely rebuilt 2026-07-25** (per an explicit user decision) from a 33-tool surface down to exactly **two abilities**, because the prior surface was too large for `claude-haiku-4-5` to reliably keep track of:
+- **`propose_calendar_change`** — create, move, or delete a calendar event (any category — a normal block, focus time, a meeting, a buffer, etc).
+- **`find_free_time`** — read-only lookup of open time windows, honoring working hours and standing scheduling rules.
 
-**Confirmed v1 posture — nothing auto-applies from chat:** `AUTO_APPLY_CATEGORIES` only keys on `category`, not `source_system` (item 20, still explicitly out of scope) — every proposal this layer creates lands `pending` and needs the same manual approval tap as any other `source_system`, regardless of how directly the user phrased the request. Revisit only if this turns out to be real friction in practice.
+Everything else from the prior surface (tasks, habits, scheduling-rule declarations, batch/group operations, bulk-edit, recurring series, relocate, reschedule/rebalance, focus/buffer/task/habit auto-placement, approve/reject/revert, an explicit data refresh, capability-gap logging, progressive-disclosure reference docs) is gone from chat entirely — still reachable through the rest of this API, just not from this conversation. Ambiguity is handled by the model just asking in its plain-text reply; there's no dedicated clarifying-question tool anymore.
+
+**Structurally guaranteed to never apply anything without manual approval — not just a prompt instruction.** There is no approve/reject/revert tool in this surface at all, so the model cannot apply a proposal even if asked to. `propose_calendar_change` additionally forces `skipAutoApply: true` on every call (`lib/nlToolDispatch.ts`), which bypasses `AUTO_APPLY_CATEGORIES` entirely for this path — **live-verified**: with `AUTO_APPLY_CATEGORIES=personal` set, an identical `personal`-category proposal auto-applied immediately through the direct `POST /api/proposed-changes` call but stayed `pending` when created through chat. Every proposal this layer creates needs the same manual approval tap through the app, regardless of category or how directly the user phrased the request — this is now unconditional, not a v1 posture pending revisit.
+
+Conversation history is lightweight and text-only (`chat_conversations`/`chat_messages`, `backend-schema.md`) — only final user/assistant text is persisted, never intermediate tool calls. Context is trimmed to just what these two abilities need: resolved time anchors and the upcoming calendar digest (the only source of existing event ids for a move/delete — there's no dedicated lookup tool, so an event beyond the digest's 7-day window can't be referenced by name).
 
 **Model policy:** `claude-haiku-4-5` by default; escalate to `claude-sonnet-5` only for a specific step that proves too heavy for Haiku in practice. `claude-opus-4-8`/`claude-fable-5` are never used — standing project policy, not specific to this route.
 
@@ -1179,14 +1233,21 @@ An unrecognized/stale `conversation_id` is treated as "start fresh" (a new conve
 ```json
 {
   "conversation_id": "uuid",
-  "reply": "string — the assistant's final text (or the clarifying question, if the loop short-circuited)",
-  "proposals": "ProposedChangeRow[] — whatever this turn's tool calls actually created",
-  "group_id": "string (optional) — set when a batch/bulk-edit/recurring-series call produced one",
-  "clarification": "string (optional) — present only when the loop exited via ask_clarifying_question; equal to \"reply\" in that case"
+  "reply": "string — the assistant's final text",
+  "proposals": "ProposedChangeRow[] — whatever this turn's tool call actually created",
+  "usage": {
+    "inputTokens": "number — summed across every messages.create() call this turn made (up to 6, the iteration cap)",
+    "outputTokens": "number",
+    "cacheCreation5mTokens": "number",
+    "cacheCreation1hTokens": "number",
+    "cacheReadTokens": "number",
+    "estimatedCostUsd": "number — computed from the above against claude-haiku-4-5's/claude-sonnet-5's published per-token rates and Anthropic's cache-read/write multipliers; NOT a billed total, an estimate (lib/nlLoop.ts's MODEL_PRICING, hardcoded, needs a manual update if pricing changes)"
+  }
 }
 ```
+`group_id`/`clarification` no longer appear — there's no batch/group-producing tool and no dedicated clarifying-question tool anymore. **Note on caching:** with only 2 tools, the stable system-prompt prefix shrank to ~1,576 tokens — live-verified too small to trigger prompt caching at all (`cacheCreation1hTokens`/`cacheReadTokens` were both `0` on every test call). The `cache_control` breakpoint is left in place (harmless, and would start working again if the tool surface ever grows), but don't expect a cost/latency benefit from it at the current size.
 
-**Errors:** `401` unauthorized, `400` if `message` is missing/empty or `conversation_id` is malformed, `500` on an Anthropic API failure or an uncaught Supabase/Google failure. A tool-level failure (bad input, a real conflict, a rule violation) does not surface as an HTTP error — it's caught and fed back to the model as a `tool_result` with `is_error: true`, so the model can react (retry, explain, fall back to `log_capability_gap`) rather than the whole request aborting.
+**Errors:** `401` unauthorized, `400` if `message` is missing/empty or `conversation_id` is malformed, `500` on an Anthropic API failure or an uncaught Supabase/Google failure. A tool-level failure (bad input, a real conflict, a rule violation) does not surface as an HTTP error — it's caught and fed back to the model as a `tool_result` with `is_error: true`, so the model can react (explain, try a different time) rather than the whole request aborting.
 
 ---
 

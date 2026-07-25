@@ -4,16 +4,23 @@
 // function got pulled into a file vitest expects to be side-effect-free.
 // Kept import-free here for an additional, Phase-5-specific reason too: the
 // NL chat loop's cache_control breakpoint sits right after the *stable*
-// system-prompt content (tool manifest + behavioral rules + enums) — nothing
-// in this file may ever be pulled into that stable block, since every
-// formatter here (especially formatTimeAnchors) recomputes something that
-// changes on literally every request. See lib/nlContextQuery.ts for the IO
-// half that fetches the raw data these functions format, and
-// app/api/chat/route.ts for where the stable/volatile split actually happens.
+// system-prompt content (behavioral rules + tools) — nothing in this file
+// may ever be pulled into that stable block, since every formatter here
+// (especially formatTimeAnchors) recomputes something that changes on
+// literally every request. See lib/nlContextQuery.ts for the IO half that
+// fetches the raw data these functions format, and app/api/chat/route.ts
+// for where the stable/volatile split actually happens.
+//
+// Complete rebuild (2026-07-25): trimmed to just the two formatters the
+// 2-tool surface (lib/nlToolManifest.ts) actually needs — time anchors and
+// the calendar digest. formatOpenState/formatSyncFreshness were removed
+// along with the tools/context they supported (open state — pending
+// proposals/groups/recent actions — and data freshness/refresh_data), since
+// neither is actionable information for a model that can only
+// propose_calendar_change/find_free_time.
 import { DateTime } from 'luxon';
 import type { SchedulingConfig } from './schedulingConfig';
 import type { CalendarEventSummary } from './calendarEvents';
-import type { ProposedChangeRow } from './proposedChanges';
 
 const WEEKDAY_NAMES = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];
 
@@ -47,53 +54,10 @@ function formatEventLine(event: CalendarEventSummary): string {
 }
 
 // Given an already-fetched near-term event list (lib/nlContextQuery.ts's
-// fetchCalendarDigest) — pure string formatting, no fetch of its own.
+// fetchCalendarDigest) — pure string formatting, no fetch of its own. This
+// is also the only source of existing event ids for a move/delete
+// propose_calendar_change call — there's no dedicated lookup tool.
 export function formatCalendarDigest(events: CalendarEventSummary[]): string {
   if (events.length === 0) return 'No upcoming events in the digest window.';
   return events.map(formatEventLine).join('\n');
-}
-
-export interface RecentActionSummary {
-  id: string;
-  change_type: string;
-  category: string;
-  summary: string | null;
-  status: string;
-  decided_at: string | null;
-}
-
-// "Open state" — pending proposals (individual + grouped) plus a short
-// window of recently-decided ones, so "undo that" / "what did I just do" has
-// something concrete in context to point at, per this project's confirmed
-// persistence design (recompute fresh every turn, never replay tool-call
-// history — see backend-schema.md's chat_conversations/chat_messages entry).
-export function formatOpenState(
-  pendingProposals: ProposedChangeRow[],
-  pendingGroupIds: string[],
-  recentActions: RecentActionSummary[]
-): string {
-  const lines: string[] = [];
-
-  if (pendingProposals.length === 0) {
-    lines.push('No pending proposals.');
-  } else {
-    lines.push(`Pending proposals (${pendingProposals.length}):`);
-    for (const p of pendingProposals) {
-      const groupNote = p.proposal_group_id ? ` [group ${p.proposal_group_id}]` : '';
-      lines.push(`- ${p.id}: ${p.change_type} "${p.proposed_summary ?? p.target_event_id ?? '?'}" (${p.category})${groupNote}`);
-    }
-  }
-
-  if (pendingGroupIds.length > 0) {
-    lines.push(`Pending proposal groups: ${pendingGroupIds.join(', ')}`);
-  }
-
-  if (recentActions.length > 0) {
-    lines.push(`Recently decided (most recent first):`);
-    for (const a of recentActions) {
-      lines.push(`- ${a.id}: ${a.change_type} "${a.summary ?? '?'}" (${a.category}) → ${a.status} at ${a.decided_at ?? '?'}`);
-    }
-  }
-
-  return lines.join('\n');
 }
