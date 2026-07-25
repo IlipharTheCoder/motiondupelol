@@ -22,6 +22,11 @@ final class ChatViewModel {
     // queue almost certainly changed.
     var onProposalsReceived: (() -> Void)?
 
+    // Fired when `tasksChanged` comes back true — create_task/unassign_task
+    // (2026-07-25) mutate the tasks table directly with no proposal to carry
+    // the signal, unlike propose_calendar_change/assign_task_to_event.
+    var onTasksChanged: (() -> Void)?
+
     func send(_ text: String) async {
         let trimmed = text.trimmingCharacters(in: .whitespaces)
         guard !trimmed.isEmpty else { return }
@@ -35,6 +40,9 @@ final class ChatViewModel {
             sessionCostUsd += response.usage.estimatedCostUsd
             if !response.proposals.isEmpty {
                 onProposalsReceived?()
+            }
+            if response.tasksChanged {
+                onTasksChanged?()
             }
         } catch {
             history.append(ChatMessage(role: .assistant, text: "Error: \(error.localizedDescription)"))

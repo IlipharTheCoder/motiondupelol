@@ -212,7 +212,7 @@ Prompted by a direct question ("does anything auto-pull synced events, or is tha
 
 `tsc`, the full test suite (74 passing, down from 80 — the 6 removed tests were for the now-deleted formatters), and lint are all clean.
 
-## NL chat layer — grown to 5 abilities, priority deferred to confirmation, unrestricted free-time (2026-07-25, same day)
+## NL chat layer — grown to 6 abilities, priority deferred to confirmation, unrestricted free-time (2026-07-25, same day)
 
 **Three separate asks, same session, resolved through clarifying questions before any code:**
 
@@ -223,6 +223,12 @@ Prompted by a direct question ("does anything auto-pull synced events, or is tha
 3. **"Remove the find time rules, everything is fair game in find_time... I'll trust the NL model to work with the times it has."** Scoped to chat's `find_free_time` tool only — `lib/freeSlots.ts`'s `findFreeSlots` gained an `ignoreWorkingHoursAndRules` option (skips `generateWorkingWindows`/`fetchApplicableSchedulingRules` entirely, treats the whole requested range as one window, still subtracts real busy time — conflict-checking stays on, confirmed explicitly: "skip working hours + scheduling rules, keep conflict-checking"). Every other caller (habits, Focus Time, auto-reschedule, day-rebalance, bump-relocation, `GET /api/calendar/free-slots`) never sets it and is completely unaffected. `category`/`tags` dropped from `find_free_time`'s tool schema too, since they only ever existed to scope which scheduling rules apply — meaningless once rules are skipped for this call path. The user explicitly declined adding working-hours context as informational-only text to ground the model's judgment ("generic world knowledge is fine, because it's just as flexible for me") — `nlSystemPrompt.ts` just instructs the model to prefer normal waking hours unless the user's request implies otherwise, no personalized config surfaced.
 
 `tsc` and the full test suite (74 passing, unchanged — no dedicated unit tests existed for `nlToolDispatch.ts`/`nlToolManifest.ts` before this either) are clean.
+
+**Follow-up same day: `create_task`, the 6th ability.** "Add a way to add tasks with deadlines to NL, this might need making an endpoint" — turned out no new endpoint was needed at all: `POST /api/tasks` and its underlying `lib/tasksWrite.ts::createTask` already existed and already supported `deadline`, and that function's own top comment says it was extracted from the route specifically in anticipation of an NL `create_task` tool that never actually got built until now. Landed as a thin wrapper, instant/unproposed — same reasoning as `unassign_task` and the direct endpoint itself (a task the user states directly isn't external unreviewed data needing review). Task priority is explicitly not gated the way calendar-block priority now is — the user confirmed directly that `tasks.priority` is "a different beast" from a calendar event's priority, so the model can set it here same as the direct API always allowed.
+
+**A real gap surfaced in the process and fixed for both instant tools, not just the new one:** `create_task` and the already-shipped `unassign_task` both mutate the `tasks` table directly with zero signal back to the client — unlike `propose_calendar_change`/`assign_task_to_event`, whose output flows through the `proposals` array. Fixed with a new `tasksChanged: boolean` on `LoopResult`/`ChatResponse` (`tasks_changed` over the wire), true whenever either of those two tools ran successfully this turn — a client reloads its task list on `true`, the same way a non-empty `proposals` already means "reload the approval queue." This closes a latent bug that existed for `unassign_task` since it shipped earlier the same day, not just a gap in the new tool.
+
+`tsc` and the full test suite (still 74 passing) clean; Xcode build green after wiring `ChatViewModel.onTasksChanged` → `TasksViewModel.load()` in `MainView`.
 
 ## Phase 6 — Deferred / lower priority
 

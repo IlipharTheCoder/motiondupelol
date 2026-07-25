@@ -21,6 +21,7 @@ import {
   scheduleTaskToNewEvent,
   unscheduleTask,
 } from './aiTasks';
+import { createTask } from './tasksWrite';
 
 export type ToolExecutionResult = { result: unknown } | { error: string };
 
@@ -136,6 +137,18 @@ export async function executeTool(name: string, rawInput: unknown): Promise<Tool
 
       case 'unassign_task':
         return { result: await unscheduleTask(requiredString(input, 'task_id')) };
+
+      case 'create_task':
+        return {
+          result: await createTask({
+            title: requiredString(input, 'title'),
+            description: input.description as string | undefined,
+            deadline: input.deadline as string | undefined,
+            priority: input.priority as never,
+            duration_minutes: input.duration_minutes as number | undefined,
+            tags: input.tags as string[] | undefined,
+          }),
+        };
 
       default:
         return { error: `Unknown tool "${name}"` };

@@ -103,7 +103,18 @@ export interface LoopResult {
   text: string;
   proposals: ProposedChangeRow[];
   usage: ChatUsage;
+  tasksChanged: boolean;
 }
+
+// Tools that mutate the tasks table directly, with no proposed_changes row
+// to signal the change (unlike propose_calendar_change/assign_task_to_event,
+// whose output already flows through `proposals`) — added 2026-07-25
+// alongside create_task, when the same gap was noticed already existing for
+// unassign_task: neither tool gave the client any way to know its task list
+// just went stale. tasksChanged is the fix — a client refreshes its task
+// list when this comes back true, the same way a non-empty `proposals`
+// already signals "refresh the approval queue."
+const TASK_MUTATING_TOOLS = new Set(['create_task', 'unassign_task']);
 
 function extractText(content: Anthropic.ContentBlock[]): string {
   return content
@@ -120,6 +131,7 @@ export async function runChatLoop(
 ): Promise<LoopResult> {
   const proposals: ProposedChangeRow[] = [];
   const usage = emptyUsage();
+  let tasksChanged = false;
 
   for (let iteration = 0; iteration < MAX_ITERATIONS; iteration++) {
     const response = await anthropic.messages.create({
@@ -136,18 +148,20 @@ export async function runChatLoop(
     );
 
     if (toolUseBlocks.length === 0) {
-      return { text: extractText(response.content), proposals, usage };
+      return { text: extractText(response.content), proposals, usage, tasksChanged };
     }
 
     const results = await Promise.all(
       toolUseBlocks.map((block) => executeTool(block.name, block.input))
     );
 
-    for (const outcome of results) {
+    toolUseBlocks.forEach((block, i) => {
+      const outcome = results[i];
       if ('result' in outcome) {
         proposals.push(...collectProposals(outcome.result));
+        if (TASK_MUTATING_TOOLS.has(block.name)) tasksChanged = true;
       }
-    }
+    });
 
     // Every tool_use block in this assistant turn gets exactly one
     // tool_result, and all of them land in a single subsequent user message
@@ -175,5 +189,6 @@ export async function runChatLoop(
     text: "I wasn't able to finish this within my step limit — here's what I did so far. You may need to ask again for the rest.",
     proposals,
     usage,
+    tasksChanged,
   };
 }

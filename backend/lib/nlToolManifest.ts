@@ -33,8 +33,20 @@
 // Same day: propose_calendar_change dropped its `priority` field entirely,
 // and find_free_time dropped `category`/`tags` and now ignores working
 // hours/scheduling_rules — see nlToolDispatch.ts's dispatch cases for both.
+//
+// Grown to 6 tools (2026-07-25, same day): added create_task, wrapping
+// lib/tasksWrite.ts's createTask — the same function POST /api/tasks calls,
+// which was itself refactored out of that route specifically in
+// anticipation of this tool (see that file's own top comment) but never
+// actually got one until now. Instant/unproposed, matching that endpoint's
+// existing behavior exactly (a task the user states directly isn't
+// external unreviewed data, so it isn't gated behind review — same
+// reasoning POST /api/tasks and unassign_task already rely on). Unlike a
+// calendar-block's priority, task priority is a separate concern the user
+// explicitly confirmed is fine for the model to set directly here, same as
+// the direct API already allows at creation time.
 import type Anthropic from '@anthropic-ai/sdk';
-import { BURNER_EVENT_TYPES } from './eventMetadata';
+import { BURNER_EVENT_TYPES, EVENT_PRIORITIES } from './eventMetadata';
 
 const CHANGE_TYPES = ['create', 'move', 'delete'];
 
@@ -110,6 +122,23 @@ export const NL_TOOLS: Anthropic.Tool[] = [
         task_id: { type: 'string', description: 'The task to unassign. Must currently be scheduled.' },
       },
       required: ['task_id'],
+    },
+  },
+  {
+    name: 'create_task',
+    description:
+      'Add a new task to the task list, optionally with a deadline — for something to track, not necessarily to put on the calendar yet. Applies immediately, no approval needed; this only inserts into the task list, it never touches the calendar. Use assign_task_to_event separately afterward if the user also wants it placed onto the calendar right away.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        title: { type: 'string', description: 'Required.' },
+        description: { type: 'string' },
+        deadline: { type: 'string', description: 'ISO datetime — a "must be done by" constraint. Optional.' },
+        priority: { type: 'string', enum: EVENT_PRIORITIES },
+        duration_minutes: { type: 'number', description: 'Expected time to complete, in minutes.' },
+        tags: { type: 'array', items: { type: 'string' } },
+      },
+      required: ['title'],
     },
   },
 ];

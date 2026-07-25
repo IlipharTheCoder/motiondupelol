@@ -14,6 +14,7 @@ struct ChatResponse: Decodable {
     let reply: String
     let proposals: [ProposedChange]
     let usage: ChatUsage
+    let tasksChanged: Bool
 }
 
 struct APIClient {

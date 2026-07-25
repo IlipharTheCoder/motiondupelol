@@ -129,6 +129,7 @@ export async function POST(request: Request) {
       reply: loopResult.text,
       proposals: loopResult.proposals,
       usage: loopResult.usage,
+      tasks_changed: loopResult.tasksChanged,
     });
   } catch (error) {
     return Response.json({ error: (error as Error).message }, { status: 500 });

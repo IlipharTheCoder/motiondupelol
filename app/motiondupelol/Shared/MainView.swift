@@ -23,6 +23,7 @@ struct MainView: View {
         .navigationTitle("Calendar Manager")
         .task {
             chatVM.onProposalsReceived = { Task { await approvalsVM.refresh() } }
+            chatVM.onTasksChanged = { Task { await tasksVM.load() } }
             approvalsVM.onApplied = { Task { await tasksVM.load() } }
             await tasksVM.load()
             await approvalsVM.refresh()
