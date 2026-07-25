@@ -222,11 +222,24 @@ export interface HabitPlacementSummary {
   results: HabitOccurrenceResult[];
 }
 
+export interface PlanHabitPlacementOptions {
+  // Forced true by the NL chat layer's dispatch (lib/nlToolDispatch.ts,
+  // 2026-07-25's plan_habits tool) so a chat-initiated plan run can never
+  // bypass manual review via AUTO_APPLY_CATEGORIES, regardless of its
+  // configuration — same guarantee propose_calendar_change/
+  // assign_task_to_event already have. Defaults false/unset here so the
+  // direct API (POST /api/habits/plan) keeps its existing behavior.
+  skipAutoApply?: boolean;
+}
+
 // Occurrence-count auto-fill with spacing (architecture-plan.md section 4f).
 // No from/to params — like planFocusTime, always "the current period,"
 // here per-habit via each habit's own cadence rather than one
 // caller-supplied range.
-export async function planHabitPlacement(now: Date = new Date()): Promise<HabitPlacementSummary> {
+export async function planHabitPlacement(
+  now: Date = new Date(),
+  options: PlanHabitPlacementOptions = {}
+): Promise<HabitPlacementSummary> {
   const config = getSchedulingConfig();
 
   const { data: habitRows, error } = await supabase.from('habits').select('*').eq('status', 'active');
@@ -304,27 +317,30 @@ export async function planHabitPlacement(now: Date = new Date()): Promise<HabitP
           continue;
         }
 
-        const proposal = await createProposedChange({
-          change_type: 'create',
-          category: 'habit',
-          // Opposite of Focus Time's auto-defend — fine to get bumped, fine
-          // to not fit some period. flexible:'true' lets autoReschedule.ts
-          // move it aside for anything less yielding; priority:'low' (by
-          // default) means it loses every tie against everything else.
-          flexible: 'true',
-          priority: resolveHabitPriority(ctx.habit),
-          source_system: 'ai-engine',
-          source_id: ctx.habit.id,
-          proposed_summary: ctx.habit.title,
-          proposed_description: ctx.habit.description ?? undefined,
-          duration_minutes: occurrenceDurationMinutes,
-          tags: ctx.habit.tags ?? undefined,
-          proposed_start: new Date(chosen.start).toISOString(),
-          proposed_end: new Date(chosen.end).toISOString(),
-          reason: `Habit "${ctx.habit.title}" — occurrence ${i + 1} of ${ctx.habit.target_count} needed this ${cadenceLabel(
-            ctx.habit.cadence
-          )}`,
-        });
+        const proposal = await createProposedChange(
+          {
+            change_type: 'create',
+            category: 'habit',
+            // Opposite of Focus Time's auto-defend — fine to get bumped, fine
+            // to not fit some period. flexible:'true' lets autoReschedule.ts
+            // move it aside for anything less yielding; priority:'low' (by
+            // default) means it loses every tie against everything else.
+            flexible: 'true',
+            priority: resolveHabitPriority(ctx.habit),
+            source_system: 'ai-engine',
+            source_id: ctx.habit.id,
+            proposed_summary: ctx.habit.title,
+            proposed_description: ctx.habit.description ?? undefined,
+            duration_minutes: occurrenceDurationMinutes,
+            tags: ctx.habit.tags ?? undefined,
+            proposed_start: new Date(chosen.start).toISOString(),
+            proposed_end: new Date(chosen.end).toISOString(),
+            reason: `Habit "${ctx.habit.title}" — occurrence ${i + 1} of ${ctx.habit.target_count} needed this ${cadenceLabel(
+              ctx.habit.cadence
+            )}`,
+          },
+          { skipAutoApply: options.skipAutoApply }
+        );
 
         result.occurrencesProposed++;
         result.results.push({

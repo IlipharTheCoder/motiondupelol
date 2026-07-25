@@ -23,6 +23,7 @@ import {
   completeTask,
 } from './aiTasks';
 import { createTask } from './tasksWrite';
+import { planHabitPlacement, type HabitPlacementSummary } from './habitPlacement';
 
 export type ToolExecutionResult = { result: unknown } | { error: string };
 
@@ -55,13 +56,24 @@ function isProposedChangeRow(value: unknown): value is ProposedChangeRow {
 // assign_task_to_event (added 2026-07-25) wraps lib/aiTasks.ts's own
 // {mode, proposal} result shape instead, since it reuses those functions'
 // existing return type rather than reinventing a flat one — so this also
-// unwraps a `.proposal` field. app/api/chat/route.ts uses this to populate
-// the response's `proposals` field.
+// unwraps a `.proposal` field. plan_habits (added 2026-07-25) is a genuine
+// fan-out — one HabitPlacementSummary per call, but zero-to-many proposals
+// inside its `results` array (only entries with outcome: 'proposed' carry
+// one) — so this also walks that array. app/api/chat/route.ts uses this to
+// populate the response's `proposals` field.
 export function collectProposals(value: unknown): ProposedChangeRow[] {
   if (isProposedChangeRow(value)) return [value];
   if (value && typeof value === 'object' && 'proposal' in value) {
     const proposal = (value as { proposal?: unknown }).proposal;
     if (isProposedChangeRow(proposal)) return [proposal];
+  }
+  if (value && typeof value === 'object' && 'results' in value) {
+    const results = (value as { results?: unknown }).results;
+    if (Array.isArray(results)) {
+      return results
+        .map((entry) => (entry && typeof entry === 'object' ? (entry as { proposal?: unknown }).proposal : undefined))
+        .filter(isProposedChangeRow);
+    }
   }
   return [];
 }
@@ -154,6 +166,15 @@ export async function executeTool(name: string, rawInput: unknown): Promise<Tool
 
       case 'complete_task':
         return { result: await completeTask(requiredString(input, 'task_id')) };
+
+      case 'plan_habits': {
+        // skipAutoApply: true, always — the user was explicit that habit
+        // planning must go through the same review tree as everything else
+        // in chat, even though the direct API (POST /api/habits/plan)
+        // doesn't force this and still respects AUTO_APPLY_CATEGORIES.
+        const summary: HabitPlacementSummary = await planHabitPlacement(new Date(), { skipAutoApply: true });
+        return { result: summary };
+      }
 
       default:
         return { error: `Unknown tool "${name}"` };

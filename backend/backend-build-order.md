@@ -242,6 +242,12 @@ New `lib/eventTaskDescriptionFormat.ts` (pure — `buildTasksSection`/`withTasks
 
 `tsc`, lint, and the full test suite (still 83 passing — no new unit tests, this is state-transition/route logic mirroring `unscheduleTask`'s already-covered shape rather than new pure algorithmic surface) clean.
 
+**Follow-up same day: `plan_habits`, the 8th NL tool.** Goal stated directly: "tell it 'plan my week's habits' and it populates ... calendar event habit times for each habit." The engine already existed and fully worked (`lib/habitPlacement.ts::planHabitPlacement`, behind `POST /api/habits/plan`) — habits had simply been cut entirely from chat in the original 2-tool rebuild and never added back, unlike tasks. Two things confirmed directly before building, since both were real forks: (1) the underlying engine has no date-range param at all — it always plans each habit against *its own* cadence period (a monthly habit plans against the current month, not "this week," regardless of how the user phrases the request) — user confirmed this is fine, they just want future occurrences auto-populated, not literally scoped to a calendar week; (2) unlike `unassign_task`/`create_task`/`complete_task`, this had to go through the review queue like every other calendar-affecting tool, even though `planHabitPlacement`'s own `createProposedChange` call doesn't force `skipAutoApply` and would otherwise respect `AUTO_APPLY_CATEGORIES` — user was explicit: "everything, even habit stuff, should go through the confirm tree."
+
+`planHabitPlacement` gained an optional `{ skipAutoApply }` options param (default `false`/unset, so `POST /api/habits/plan`'s existing behavior is unchanged — this option is internal-only, no public route exposes it, same pattern as `createProposedChange`'s own flag), threaded through to its per-occurrence `createProposedChange` call. The NL tool always passes `true`. **Genuinely new plumbing, not just a wrapper:** `planHabitPlacement` returns a fan-out summary (`results: [{ outcome, proposal? }, ...]`), one entry per occurrence — a different shape from every prior tool's single-proposal or single-wrapped-proposal result, so `collectProposals` (`lib/nlToolDispatch.ts`) gained a third case walking that `results` array and collecting whichever entries have a `.proposal`.
+
+`tsc`, lint, and the full test suite (still 83 passing) clean.
+
 ## Phase 6 — Deferred / lower priority
 
 Explicitly parked, not forgotten:

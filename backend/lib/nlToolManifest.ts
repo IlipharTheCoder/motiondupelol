@@ -53,6 +53,18 @@
 // Instant/unproposed, same reasoning as unassign_task/create_task — pure
 // tasks-table bookkeeping, never touches the calendar event itself even if
 // the task was scheduled (the event stays as an accurate historical record).
+//
+// Grown to 8 tools (2026-07-25, same day): added plan_habits, wrapping
+// lib/habitPlacement.ts's planHabitPlacement — habits were cut entirely from
+// chat in the original rebuild and never added back until now. Unlike
+// unassign_task/create_task/complete_task, this one is NOT instant — the
+// user was explicit that habit planning must go through the same review
+// tree as everything else, so nlToolDispatch.ts forces
+// skipAutoApply: true on every occurrence proposal it creates, closing the
+// one gap where the direct API (POST /api/habits/plan) would otherwise
+// respect AUTO_APPLY_CATEGORIES. No params — mirrors the direct endpoint's
+// own shape exactly (always "the current period," per habit, via each
+// habit's own cadence — not a caller-supplied date range).
 import type Anthropic from '@anthropic-ai/sdk';
 import { BURNER_EVENT_TYPES, EVENT_PRIORITIES } from './eventMetadata';
 
@@ -159,6 +171,15 @@ export const NL_TOOLS: Anthropic.Tool[] = [
         task_id: { type: 'string', description: 'The task to complete. Must currently be unscheduled or scheduled.' },
       },
       required: ['task_id'],
+    },
+  },
+  {
+    name: 'plan_habits',
+    description:
+      'Auto-fill this period\'s remaining habit occurrences onto the calendar, spaced out rather than clustered together. Operates on every active habit at once, each against its own cadence period (a weekly habit plans against this week, a monthly one against this month, etc.) — there is no way to scope this to a specific date range. Every occurrence this creates is a "pending" proposal in the review queue, same as propose_calendar_change — it never applies anything to the real calendar automatically, even though the direct API sometimes can.',
+    input_schema: {
+      type: 'object',
+      properties: {},
     },
   },
 ];
