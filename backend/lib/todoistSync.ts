@@ -1,5 +1,6 @@
 import { supabase } from './supabase';
 import { createProposedChange } from './proposedChanges';
+import { updateTask, type UpdateTaskInput } from './tasksWrite';
 
 // Migrated 2026-07-24 — the old rest/v2 base this pointed at was deprecated
 // (410, "endpoint is deprecated... use /api/v1/") and replaced by Todoist's
@@ -14,6 +15,14 @@ import { createProposedChange } from './proposedChanges';
 // to reconcile; if this ever needs re-running against a populated table,
 // the old rows' `source_id`s are guaranteed not to match anything the new
 // API returns and should be treated as orphaned, not diffed against.
+// Also independently defined in lib/todoistWrite.ts (2026-07-25) rather than
+// exported/imported from here — todoistSync.ts now imports updateTask from
+// lib/tasksWrite.ts (for the Todoist→us edit-sync path below), which itself
+// imports lib/todoistWrite.ts (for the push direction), which would create
+// a genuine runtime circular value-import (todoistSync → tasksWrite →
+// todoistWrite → todoistSync) if this constant were shared that way. A
+// duplicated one-line string constant is cheaper than untangling that,
+// same tradeoff this codebase already accepts for BURNER_CALENDAR_ID.
 const TODOIST_API_BASE = 'https://api.todoist.com/api/v1';
 
 interface TodoistDue {
@@ -81,6 +90,67 @@ function todoistDurationMinutes(duration: TodoistDuration | null): number | unde
   return duration.unit === 'day' ? duration.amount * 24 * 60 : duration.amount;
 }
 
+// Todoist → us edit propagation (2026-07-25, two-way sync — "Todoist is
+// master," per the user's own framing). Closes a previously explicit,
+// accepted gap: a title/deadline/description/duration change made in
+// Todoist after intake used to be silently ignored forever (this file's
+// git history called it a "create-once limitation"). Deliberately does NOT
+// touch priority/tags — those stay reserved for your own judgment at
+// review time, same reasoning intake itself already used to leave them
+// unset in the first place ("Todoist can't tell us how you want to
+// prioritize/organize your own work").
+async function syncEditFromTodoist(existing: SyncedTaskRow, task: TodoistTask): Promise<void> {
+  const newTitle = task.content;
+  const newDescription = task.description || null;
+  const newDeadline = todoistDeadline(task.due) ?? null;
+  const newDurationMinutes = todoistDurationMinutes(task.duration) ?? null;
+
+  if (existing.task_id) {
+    const { data, error } = await supabase.from('tasks').select('*').eq('id', existing.task_id).maybeSingle();
+    if (error) throw new Error(`tasks read failed: ${error.message}`);
+    if (!data) return; // Row is gone (e.g. already resolved/cleaned up elsewhere) — nothing to sync into.
+
+    const patch: UpdateTaskInput = {};
+    if (data.title !== newTitle) patch.title = newTitle;
+    if ((data.description ?? null) !== newDescription) patch.description = newDescription;
+    if ((data.deadline ?? null) !== newDeadline) patch.deadline = newDeadline;
+    if ((data.duration_minutes ?? null) !== newDurationMinutes) patch.duration_minutes = newDurationMinutes;
+    if (Object.keys(patch).length === 0) return;
+
+    // skipTodoistPush: true — this edit came FROM Todoist; echoing it
+    // straight back would be pointless (Todoist already has it) and adds a
+    // failure surface for nothing.
+    await updateTask(existing.task_id, patch, { skipTodoistPush: true });
+    return;
+  }
+
+  if (existing.proposed_change_id) {
+    const { data, error } = await supabase
+      .from('proposed_changes')
+      .select('*')
+      .eq('id', existing.proposed_change_id)
+      .maybeSingle();
+    if (error) throw new Error(`proposed_changes read failed: ${error.message}`);
+    // Already decided (approved/rejected outside this sync's own withdrawal
+    // path, e.g. a manual reject in the app) — leave it alone rather than
+    // editing a resolved row.
+    if (!data || (data.status !== 'pending' && data.status !== 'failed')) return;
+
+    const patch: Record<string, unknown> = {};
+    if (data.proposed_summary !== newTitle) patch.proposed_summary = newTitle;
+    if ((data.proposed_description ?? null) !== newDescription) patch.proposed_description = newDescription;
+    if ((data.deadline ?? null) !== newDeadline) patch.deadline = newDeadline;
+    if ((data.duration_minutes ?? null) !== newDurationMinutes) patch.duration_minutes = newDurationMinutes;
+    if (Object.keys(patch).length === 0) return;
+
+    const { error: updateError } = await supabase
+      .from('proposed_changes')
+      .update(patch)
+      .eq('id', existing.proposed_change_id);
+    if (updateError) throw new Error(`proposed_changes update failed: ${updateError.message}`);
+  }
+}
+
 async function fetchActiveTasks(): Promise<TodoistTask[]> {
   const token = process.env.TODOIST_API_TOKEN;
   if (!token) throw new Error('TODOIST_API_TOKEN is not set');
@@ -138,8 +208,14 @@ export async function runTodoistSync(): Promise<TodoistSyncResult> {
   // review-queue principle as everywhere else). Priority/tags are
   // deliberately left unset here; you set them when you review the proposal.
   for (const task of activeTasks) {
-    if (existingBySourceId.has(task.id)) {
+    const existing = existingBySourceId.get(task.id);
+    if (existing) {
       result.skippedExisting++;
+      try {
+        await syncEditFromTodoist(existing, task);
+      } catch (err) {
+        result.errors.push(err instanceof Error ? err.message : String(err));
+      }
       continue;
     }
 
@@ -212,9 +288,28 @@ export async function runTodoistSync(): Promise<TodoistSyncResult> {
         .maybeSingle();
       if (taskError) throw new Error(`tasks read failed: ${taskError.message}`);
 
-      if (taskRow?.scheduled_event_id) {
-        // Already a real calendar event — removing it deserves a tap, same
-        // as everywhere else a change touches the calendar.
+      // Status-checked first (2026-07-25, two-way sync) — this task may
+      // have vanished from Todoist *because* we pushed a completion there
+      // ourselves (lib/aiTasks.ts's completeTask → lib/todoistWrite.ts's
+      // pushTaskCompletionToTodoist), not because the user did something
+      // directly in Todoist. If it's already resolved on our side, this
+      // sync has nothing left to do to the task — just clean up the
+      // mapping below. Without this check, a task you completed here (with
+      // its calendar event correctly left alone, as a record of when the
+      // work happened) would get a spurious calendar-delete proposal or a
+      // hard delete on the very next sync, purely as an artifact of our own
+      // completion having been pushed out.
+      if (taskRow && (taskRow.status === 'completed' || taskRow.status === 'discarded')) {
+        // Already resolved — nothing further to do.
+      } else if (taskRow?.scheduled_event_id) {
+        // Still active and scheduled — Todoist genuinely vanished while
+        // this task was still open from our side. Already a real calendar
+        // event, so removing it deserves a tap, same as everywhere else a
+        // change touches the calendar. lib/proposedChanges.ts's
+        // applyProposedChange delete branch hard-deletes the linked task
+        // row once this is approved (source_system: 'todoist' there), per
+        // "Todoist is master — if it's gone there, it can be safely removed
+        // from the list."
         await createProposedChange({
           change_type: 'delete',
           category: 'task',
@@ -224,17 +319,15 @@ export async function runTodoistSync(): Promise<TodoistSyncResult> {
         });
         result.proposedDeletes++;
       } else if (taskRow) {
-        // Completed → 'completed', not 'discarded' (changed 2026-07-25, now
-        // that a real 'completed' status/action exists — see
-        // lib/aiTasks.ts's completeTask). Todoist's API still can't actually
-        // distinguish "you checked it off" from "you deleted it" (`checked`
-        // and `is_deleted` both just mean "not in the active list" —
+        // Still active, never scheduled — hard delete (changed 2026-07-25,
+        // was `status: 'completed'` before). Todoist's API still can't
+        // actually distinguish "you checked it off" from "you deleted it"
+        // (`checked`/`is_deleted` both just mean "not in the active list" —
         // fetchActiveTasks filters both out identically), so this remains
-        // an inference, not a certainty. 'completed' was judged the more
-        // honest default of the two for an unscheduled task that vanished:
-        // most Todoist tasks disappear because they were finished, and
-        // 'discarded' reads as "abandoned," which is the less common case.
-        await supabase.from('tasks').update({ status: 'completed' }).eq('id', row.task_id);
+        // an inference, not a certainty — but the user was explicit:
+        // Todoist is the master task manager, and a task gone there can be
+        // safely removed from our list too, not just marked done.
+        await supabase.from('tasks').delete().eq('id', row.task_id);
       }
 
       await supabase

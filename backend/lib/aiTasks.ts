@@ -9,6 +9,7 @@ import {
   type ProposedChangeRow,
 } from './proposedChanges';
 import { syncEventTaskDescription } from './eventTaskDescription';
+import { pushTaskCompletionToTodoist } from './todoistWrite';
 
 const BURNER_CALENDAR_ID = process.env.GOOGLE_BURNER_CALENDAR_ID!;
 const DEFAULT_TASK_DURATION_MINUTES = 30;
@@ -303,7 +304,18 @@ export async function completeTask(taskId: string): Promise<TaskRow> {
     }
   }
 
-  return data as TaskRow;
+  const completed = data as TaskRow;
+
+  // Best-effort, real-time (2026-07-25, two-way Todoist sync) — no-op if
+  // this task was never pushed/synced to Todoist; a Todoist API failure
+  // must never undo a completion that already succeeded above.
+  try {
+    await pushTaskCompletionToTodoist(completed);
+  } catch {
+    // Swallowed deliberately — see lib/todoistWrite.ts's top comment.
+  }
+
+  return completed;
 }
 
 export interface CreateTaskEventResult {

@@ -637,12 +637,31 @@ export async function applyProposedChange(
       });
       // Best-effort: if this event was backed by a `tasks` row (todoist/canvas
       // sync completion/deletion flow, architecture-plan.md section 4a step
-      // 7), close it out too. A miss here shouldn't turn an already-succeeded
-      // calendar delete into a "failed" proposal.
-      await supabase
-        .from('tasks')
-        .update({ status: 'completed' })
-        .eq('scheduled_event_id', row.target_event_id!);
+      // 7), close it out too. Wrapped in try/catch (added 2026-07-25 — the
+      // comment already claimed this, but the code didn't actually do it) so
+      // a miss here truly can't turn an already-succeeded calendar delete
+      // into a "failed" proposal.
+      //
+      // Todoist-triggered deletes hard-delete the linked task row instead of
+      // marking it 'completed' (2026-07-25, two-way sync — "Todoist is
+      // master": if it's gone there, it's safe to remove here too, not just
+      // mark done). Every other source (a manual/chat-driven delete, Canvas)
+      // keeps the original mark-completed behavior — this only branches on
+      // `source_system` for the one flow the user actually asked to be
+      // treated this way; deleting a scheduled task's calendar event for an
+      // unrelated reason (e.g. rescheduling it) shouldn't destroy the task.
+      try {
+        if (row.source_system === 'todoist') {
+          await supabase.from('tasks').delete().eq('scheduled_event_id', row.target_event_id!);
+        } else {
+          await supabase
+            .from('tasks')
+            .update({ status: 'completed' })
+            .eq('scheduled_event_id', row.target_event_id!);
+        }
+      } catch {
+        // Swallowed deliberately — see comment above.
+      }
     }
 
     return await updateProposedChange(row.id, {

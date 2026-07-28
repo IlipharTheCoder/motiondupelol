@@ -65,8 +65,19 @@
 // respect AUTO_APPLY_CATEGORIES. No params — mirrors the direct endpoint's
 // own shape exactly (always "the current period," per habit, via each
 // habit's own cadence — not a caller-supplied date range).
+//
+// Grown to 9 tools (2026-07-25, same day): added create_habit, wrapping
+// lib/habitsWrite.ts's createHabit — same function POST /api/habits calls,
+// which (like lib/tasksWrite.ts's createTask) was already refactored out of
+// its route specifically in anticipation of an NL tool that never got built
+// until now. Instant/unproposed — a habit declaration is a goal, not a
+// calendar write (backend-schema.md's own habits entry already documents
+// this as ungated even for the direct API), the same category of action as
+// create_task, not plan_habits' calendar-writing occurrences. Only the
+// occurrence *placements* plan_habits produces go through the review queue.
 import type Anthropic from '@anthropic-ai/sdk';
 import { BURNER_EVENT_TYPES, EVENT_PRIORITIES } from './eventMetadata';
+import { HABIT_CADENCES } from './habits';
 
 const CHANGE_TYPES = ['create', 'move', 'delete'];
 
@@ -180,6 +191,25 @@ export const NL_TOOLS: Anthropic.Tool[] = [
     input_schema: {
       type: 'object',
       properties: {},
+    },
+  },
+  {
+    name: 'create_habit',
+    description:
+      'Declare a new recurring habit (e.g. "gym 3x/week," "meditate every other day") — a goal to track, not a calendar write. Applies immediately, no approval needed. Use plan_habits separately afterward (or wait for the user to ask) to actually place its occurrences onto the calendar.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        title: { type: 'string', description: 'Required.' },
+        description: { type: 'string' },
+        cadence: { type: 'string', enum: HABIT_CADENCES, description: 'Which period target_count resets against.' },
+        interval_days: { type: 'number', description: 'Required only when cadence is "interval" — minimum days between consecutive occurrences (e.g. 2 for "every other day").' },
+        target_count: { type: 'number', description: 'Required. How many occurrences per period (almost always 1 for "interval" cadence).' },
+        occurrence_duration_minutes: { type: 'number', description: 'How long one occurrence takes. Defaults to 30 if omitted.' },
+        priority: { type: 'string', enum: EVENT_PRIORITIES, description: 'Defaults to "low" if omitted — habits are meant to yield to everything else, not protect their slot.' },
+        tags: { type: 'array', items: { type: 'string' } },
+      },
+      required: ['title', 'cadence', 'target_count'],
     },
   },
 ];

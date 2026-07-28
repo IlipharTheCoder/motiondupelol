@@ -24,6 +24,7 @@ import {
 } from './aiTasks';
 import { createTask } from './tasksWrite';
 import { planHabitPlacement, type HabitPlacementSummary } from './habitPlacement';
+import { createHabit } from './habitsWrite';
 
 export type ToolExecutionResult = { result: unknown } | { error: string };
 
@@ -175,6 +176,22 @@ export async function executeTool(name: string, rawInput: unknown): Promise<Tool
         const summary: HabitPlacementSummary = await planHabitPlacement(new Date(), { skipAutoApply: true });
         return { result: summary };
       }
+
+      case 'create_habit':
+        // target_count/cadence validity is enforced by createHabit itself
+        // (throws ValidationError) — no need to duplicate that check here.
+        return {
+          result: await createHabit({
+            title: requiredString(input, 'title'),
+            description: input.description as string | undefined,
+            cadence: input.cadence as never,
+            interval_days: input.interval_days as number | undefined,
+            target_count: input.target_count as number,
+            occurrence_duration_minutes: input.occurrence_duration_minutes as number | undefined,
+            priority: input.priority as never,
+            tags: input.tags as string[] | undefined,
+          }),
+        };
 
       default:
         return { error: `Unknown tool "${name}"` };
