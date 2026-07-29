@@ -1,0 +1,78 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>AI Calendar Manager — Setup</title>
+    <style>
+      body {
+        font-family: -apple-system, system-ui, sans-serif;
+        max-width: 420px;
+        margin: 40px auto;
+        color: #1f2328;
+      }
+      h1 {
+        font-size: 16px;
+      }
+      label {
+        display: block;
+        font-size: 12px;
+        color: #57606a;
+        margin-top: 16px;
+        margin-bottom: 4px;
+      }
+      input {
+        width: 100%;
+        box-sizing: border-box;
+        padding: 8px;
+        font-size: 13px;
+        border: 1px solid #d0d7de;
+        border-radius: 6px;
+      }
+      button {
+        margin-top: 20px;
+        padding: 8px 16px;
+        font-size: 13px;
+        border: none;
+        border-radius: 6px;
+        background: #2563eb;
+        color: white;
+        cursor: pointer;
+      }
+      button:disabled {
+        opacity: 0.5;
+        cursor: default;
+      }
+      #status {
+        margin-top: 12px;
+        font-size: 12px;
+      }
+      #status.error {
+        color: #c62828;
+      }
+      #status.success {
+        color: #2e7d32;
+      }
+      #hostWarning {
+        margin-top: 8px;
+        font-size: 11px;
+        color: #b26a00;
+        display: none;
+      }
+    </style>
+    <script type="module" crossorigin src="/assets/options.html-DVU54EVI.js"></script>
+  </head>
+  <body>
+    <h1>AI Calendar Manager — Setup</h1>
+    <p style="font-size: 12px; color: #57606a">
+      The key you set here is stored only on this device (<code>chrome.storage.local</code>,
+      never synced) — never hardcoded in the extension's source.
+    </p>
+    <label for="baseUrl">Backend URL</label>
+    <input id="baseUrl" type="text" placeholder="https://motiondupelol.vercel.app" />
+    <div id="hostWarning"></div>
+    <label for="apiKey">API key</label>
+    <input id="apiKey" type="password" placeholder="x-api-key value" />
+    <button id="save">Save</button>
+    <div id="status"></div>
+  </body>
+</html>

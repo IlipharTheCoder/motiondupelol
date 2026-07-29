@@ -571,6 +571,29 @@ export async function runSync(): Promise<SyncRunResult> {
   };
 }
 
+// Manually forces a full backfill for every tracked calendar, rather than
+// waiting for Google to naturally invalidate a syncToken (410) or for a
+// calendar to have never synced before. Added 2026-07-28 for
+// POST /api/calendar/resync — a deliberate "resync everything" action, not
+// something that happens automatically anywhere else. Reuses the exact
+// recovery mechanics fetchPage's own 410-handling already relies on (clear
+// sync state, let the next fetch naturally re-backfill from scratch) — just
+// triggered manually and for every tracked calendar at once, rather than
+// per-calendar as a side effect of an API error.
+//
+// A single call may not finish a large resync within runSync()'s own
+// MAX_TOTAL_RUNTIME_MS budget — same truncatedByTimeBudget/page_token
+// resumability every other backfill already has, nothing new needed here;
+// the caller should check `truncatedByTimeBudget` and call again if true.
+export async function resyncAllCalendars(): Promise<SyncRunResult> {
+  const { error } = await supabase
+    .from('calendar_sync_state')
+    .update({ sync_token: null, page_token: null, backfill_time_min: null, backfill_time_max: null })
+    .not('source_calendar_id', 'is', null); // Supabase requires an explicit filter on update(); this matches every row (the column is a non-null primary key).
+  if (error) throw new Error(`calendar_sync_state reset failed: ${error.message}`);
+  return runSync();
+}
+
 export interface DedupeResult {
   groupsScanned: number;
   groupsWithDuplicates: number;

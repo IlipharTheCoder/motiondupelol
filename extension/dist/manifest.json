@@ -1,0 +1,49 @@
+{
+  "manifest_version": 3,
+  "name": "AI Calendar Manager",
+  "version": "0.1.0",
+  "description": "Tasks, approvals, and chat for your AI calendar manager, injected into Notion Calendar.",
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "action": {
+    "default_title": "AI Calendar Manager — options"
+  },
+  "background": {
+    "service_worker": "service-worker-loader.js",
+    "type": "module"
+  },
+  "options_page": "options.html",
+  "content_scripts": [
+    {
+      "js": [
+        "assets/content-script.ts-loader-CyuqIAyB.js"
+      ],
+      "matches": [
+        "https://calendar.notion.so/*"
+      ],
+      "run_at": "document_start"
+    }
+  ],
+  "permissions": [
+    "storage"
+  ],
+  "host_permissions": [
+    "https://calendar.notion.so/*",
+    "https://motiondupelol.vercel.app/*"
+  ],
+  "web_accessible_resources": [
+    {
+      "matches": [
+        "https://calendar.notion.so/*"
+      ],
+      "resources": [
+        "assets/chat-BVUbwv3g.js",
+        "assets/content-script.ts-cR2i_D2R.js"
+      ],
+      "use_dynamic_url": false
+    }
+  ]
+}

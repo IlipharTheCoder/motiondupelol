@@ -11,7 +11,19 @@ struct TaskListView: View {
     @State private var newTaskTitle = ""
     @State private var isLoading = false
     @State private var sortOption: TaskSortOption = .dueDate
+    @State private var filterState = TaskFilterState()
     @FocusState private var composeFocused: Bool
+
+    private static let allStatuses = ["unscheduled", "scheduled", "completed", "discarded"]
+    private static let allPriorities = ["critical", "high", "medium", "low"]
+
+    private var allTags: [String] {
+        Set(vm.tasks.flatMap(\.tags)).sorted()
+    }
+
+    private var visibleTasks: [TaskItem] {
+        sortOption.sorted(filterState.apply(to: vm.tasks))
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -38,8 +50,11 @@ struct TaskListView: View {
                     if vm.tasks.isEmpty {
                         Text(vm.loadError ?? "No tasks")
                             .foregroundStyle(.secondary).font(.caption)
+                    } else if visibleTasks.isEmpty {
+                        Text("No tasks match the current filter")
+                            .foregroundStyle(.secondary).font(.caption)
                     } else {
-                        ForEach(sortOption.sorted(vm.tasks)) { task in
+                        ForEach(visibleTasks) { task in
                             TaskItemRow(task: task, onComplete: { await vm.complete(id: task.id) })
                         }
                     }
@@ -47,6 +62,7 @@ struct TaskListView: View {
                     HStack {
                         Text("Tasks")
                         Spacer()
+                        filterMenu
                         Menu {
                             ForEach(TaskSortOption.allCases) { option in
                                 Button {
@@ -70,6 +86,13 @@ struct TaskListView: View {
                             guard !isLoading else { return }
                             isLoading = true
                             Task {
+                                // Re-pull from Todoist first, not just our
+                                // own database — same combined calendar+
+                                // Todoist sync MainView already calls on
+                                // launch/foreground (2026-07-25). Best-effort:
+                                // a sync failure shouldn't block reloading
+                                // whatever we already have.
+                                try? await APIClient.shared.refresh()
                                 await vm.load()
                                 isLoading = false
                             }
@@ -108,6 +131,70 @@ struct TaskListView: View {
             }
         }
     }
+
+    // Toggle (not Button) inside a Menu, deliberately — a Toggle doesn't
+    // dismiss the menu when tapped, so multiple values can be picked in one
+    // go, unlike Button which closes the menu after every tap.
+    private var filterMenu: some View {
+        Menu {
+            Section("Status") {
+                ForEach(Self.allStatuses, id: \.self) { status in
+                    Toggle(status.capitalized, isOn: statusBinding(status))
+                }
+            }
+            Section("Priority") {
+                ForEach(Self.allPriorities, id: \.self) { priority in
+                    Toggle(priority.capitalized, isOn: priorityBinding(priority))
+                }
+            }
+            if !allTags.isEmpty {
+                Section("Tags") {
+                    ForEach(allTags, id: \.self) { tag in
+                        Toggle(tag, isOn: tagBinding(tag))
+                    }
+                }
+            }
+            if filterState.isActive {
+                Divider()
+                Button("Clear Filters", role: .destructive) {
+                    filterState = TaskFilterState()
+                }
+            }
+        } label: {
+            Image(systemName: filterState.isActive ? "line.3.horizontal.decrease.circle.fill" : "line.3.horizontal.decrease.circle")
+                .font(.caption2)
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+        .foregroundStyle(.secondary)
+    }
+
+    private func statusBinding(_ status: String) -> Binding<Bool> {
+        Binding(
+            get: { filterState.statuses.contains(status) },
+            set: { isOn in
+                if isOn { filterState.statuses.insert(status) } else { filterState.statuses.remove(status) }
+            }
+        )
+    }
+
+    private func priorityBinding(_ priority: String) -> Binding<Bool> {
+        Binding(
+            get: { filterState.priorities.contains(priority) },
+            set: { isOn in
+                if isOn { filterState.priorities.insert(priority) } else { filterState.priorities.remove(priority) }
+            }
+        )
+    }
+
+    private func tagBinding(_ tag: String) -> Binding<Bool> {
+        Binding(
+            get: { filterState.tags.contains(tag) },
+            set: { isOn in
+                if isOn { filterState.tags.insert(tag) } else { filterState.tags.remove(tag) }
+            }
+        )
+    }
 }
 
 // MARK: - Task item row (tasks table)
@@ -142,6 +229,11 @@ private struct TaskItemRow: View {
                         Text(deadline.formatted(.dateTime.month(.abbreviated).day()))
                             .font(.caption).foregroundStyle(.secondary)
                     }
+                }
+                if !task.tags.isEmpty {
+                    Text(task.tags.sorted().joined(separator: ", "))
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
                 }
             }
             Spacer()
@@ -202,6 +294,7 @@ private enum TaskSortOption: String, CaseIterable, Identifiable {
     case status
     case dueDate
     case priority
+    case tag
 
     var id: String { rawValue }
 
@@ -210,6 +303,7 @@ private enum TaskSortOption: String, CaseIterable, Identifiable {
         case .status:   return "Scheduled"
         case .dueDate:  return "Due Date"
         case .priority: return "Priority"
+        case .tag:      return "Tag"
         }
     }
 
@@ -243,6 +337,38 @@ private enum TaskSortOption: String, CaseIterable, Identifiable {
             return tasks.sorted {
                 (Self.priorityRank[$0.priority ?? ""] ?? 99) < (Self.priorityRank[$1.priority ?? ""] ?? 99)
             }
+        case .tag:
+            // Alphabetically by each task's own lowest tag (not "first
+            // tag" — that would depend on insertion order, which isn't
+            // meaningful). Untagged tasks sort last, same nil-last
+            // convention as .dueDate/.priority.
+            return tasks.sorted {
+                switch ($0.tags.min(), $1.tags.min()) {
+                case let (l?, r?): return l < r
+                case (nil, nil):   return false
+                case (nil, _):     return false
+                case (_, nil):     return true
+                }
+            }
+        }
+    }
+}
+
+// MARK: - Filter (multi-select within each category; empty set = no filter
+// for that category. Purely client-side, same as sorting above.)
+
+private struct TaskFilterState {
+    var statuses: Set<String> = []
+    var priorities: Set<String> = []
+    var tags: Set<String> = []
+
+    var isActive: Bool { !statuses.isEmpty || !priorities.isEmpty || !tags.isEmpty }
+
+    func apply(to tasks: [TaskItem]) -> [TaskItem] {
+        tasks.filter { task in
+            (statuses.isEmpty || statuses.contains(task.status))
+                && (priorities.isEmpty || priorities.contains(task.priority ?? ""))
+                && (tags.isEmpty || !tags.isDisjoint(with: task.tags))
         }
     }
 }

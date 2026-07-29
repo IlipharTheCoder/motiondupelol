@@ -276,6 +276,18 @@ New `lib/eventTaskDescriptionFormat.ts` (pure — `buildTasksSection`/`withTasks
 
 `tsc`, lint, the full test suite (still 83 passing), and a full `npm run build` (not just typecheck) all clean.
 
+## `POST /api/calendar/resync` + a data-cleanup byproduct (2026-07-28)
+
+**Two independent asks in one message.** First: "there's two events stuck on 'discarded', probably a deprecated title before the todoist shift." Investigated with a throwaway debug route (same technique as the earlier Todoist priority-scale/caching-threshold checks — built, hit once via `curl`, deleted immediately, never committed) rather than guessing: exactly two `tasks` rows, both `status: 'discarded'`, both `source_system: 'todoist'`, both unscheduled, both `created_at: 2026-07-24` — one day before this session's Todoist-sync rework replaced that exact "mark vanished-unscheduled tasks `'discarded'`" behavior first with `'completed'`, then with a hard delete. Confirmed the two ids/titles with the user, then deleted them directly (another throwaway route, one `DELETE ... WHERE id IN (...)`, removed immediately after) — a one-time fix, not a new general delete-task endpoint, since that wasn't what was asked for.
+
+**Second: "add an ability to resync our calendar with all of the google calendars as a button."** Investigated `lib/calendarSync.ts` before building anything: `runSync()` already does a full backfill per calendar, but only when that calendar's `calendar_sync_state.sync_token` happens to already be null (never-synced, or Google itself invalidated it with a `410`) — nothing let you force that on demand. Confirmed three things directly rather than assuming: (1) resync scope — force-clear state for every tracked calendar and run an immediate `runSync()` in the same request, not a narrower per-calendar picker; (2) button placement — the Chrome extension only, not the Swift app (which has no calendar-related UI at all since its own calendar-grid removal) and not backend-only.
+
+New `lib/calendarSync.ts::resyncAllCalendars()` reuses the exact recovery mechanics `fetchPage`'s existing `410` handling already relies on (clear state, let the next fetch re-backfill from scratch) — just triggered manually, for every calendar at once, rather than per-calendar as a side effect of a Google-side error. New `POST /api/calendar/resync`, response shape identical to `POST /api/calendar/sync`'s, same `truncatedByTimeBudget` resumability (a full resync across every calendar may not finish in one ~50s call).
+
+**A second, unrelated stale-doc discovery, caught purely as a side effect of reading this code closely for the new feature:** `backend-schema.md`'s `calendar_sync_state` entry claimed source calendars are "discovered live via `calendar.calendarList.list()`" — false, and had apparently been false for a while. `discoverSourceCalendars()` has always read the explicit `GOOGLE_SOURCE_CALENDAR_IDS` env var (`label:calendarId` pairs) instead — `backend-api-reference.md`'s own `POST /api/calendar/sync` entry already correctly said so, this file just never got reconciled with it. Corrected in place, flagged as a correction rather than silently rewritten.
+
+`tsc`, lint, and the full test suite (still 83 passing — no new pure logic to test here, this is route/sync-orchestration wiring reusing already-tested recovery mechanics) clean.
+
 ## Phase 6 — Deferred / lower priority
 
 Explicitly parked, not forgotten:

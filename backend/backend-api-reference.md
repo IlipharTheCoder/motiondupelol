@@ -220,6 +220,22 @@ Bounded to ~50s of work per call (Vercel `maxDuration: 60`). If a backfill is la
 
 ---
 
+## `POST /api/calendar/resync`
+
+**Added 2026-07-28.** Auth: required — same as above
+
+**Request:** no body
+
+**What it does:** force-resyncs every calendar in `GOOGLE_SOURCE_CALENDAR_IDS` from scratch — clears `sync_token`/`page_token`/`backfill_time_min`/`backfill_time_max` in `calendar_sync_state` for every tracked calendar, then calls the exact same `runSync()` `POST /api/calendar/sync` uses, in the same request (`lib/calendarSync.ts`'s `resyncAllCalendars`). Ordinary `POST /api/calendar/sync` only ever does a full backfill for a calendar that's *never* synced before, or after Google itself invalidates a `syncToken` (a `410`, handled automatically) — this is the deliberate, on-demand version of that: a way to force it yourself, for when calendar data has drifted and a full re-scan is the fix, not waiting for a natural invalidation. Reuses the exact recovery mechanics the `410` path already relies on — same resumability guarantees, same `synced_events`/`calendar_sync_state`-driven dedup, safe to call repeatedly including mid-resync.
+
+**Same time budget and resumability as `POST /api/calendar/sync`** — bounded to ~50s of work per call; a large full resync across every calendar may not finish in one call. Check `truncatedByTimeBudget`/any calendar still `status: "in_progress"` and call again with no params; it resumes from the (now-cleared) state exactly the way an ordinary first backfill would.
+
+**Response:** identical shape to `POST /api/calendar/sync`'s (`startedAt`/`finishedAt`/`durationMs`/`truncatedByTimeBudget`/`calendars[]`) — every calendar will show `mode: "backfill"` on this call, never `"incremental"`, since the whole point is forcing a fresh backfill.
+
+**Errors:** `401` unauthorized, `500` for a run-level failure (the `calendar_sync_state` reset itself failing, or calendar discovery unable to reach Google) — same per-calendar-failure-doesn't-fail-the-request behavior as `POST /api/calendar/sync` for everything past the reset step.
+
+---
+
 ## `POST /api/calendar/sync/dedupe`
 
 **Auth:** required — `x-api-key` header must match `APP_SECRET_KEY`

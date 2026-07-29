@@ -49,7 +49,7 @@ Growable/variable-length data attached to burner calendar events — deliberatel
 
 ## `calendar_sync_state`
 
-One row per external source calendar (discovered live via `calendar.calendarList.list()`, not hardcoded). Tracks incremental-sync bookkeeping for the Phase 1 sync engine (`lib/calendarSync.ts`) — Vercel functions are stateless between invocations, so this is the only place a Google `syncToken`/`pageToken` survives across runs.
+One row per external source calendar, one row per entry in the `GOOGLE_SOURCE_CALENDAR_IDS` env var (**corrected 2026-07-28** — this previously said "discovered live via `calendar.calendarList.list()`, not hardcoded," which was wrong; `lib/calendarSync.ts`'s `discoverSourceCalendars()` has always read the explicit `label:calendarId` list from that env var, not queried Google's calendar list live — sharing a calendar with a service account never populates its own `calendarList` in the first place, only its ACL permissions, which is exactly why `backend-api-reference.md`'s `POST /api/calendar/sync` entry already correctly says this and this file just hadn't been reconciled with it). Tracks incremental-sync bookkeeping for the Phase 1 sync engine (`lib/calendarSync.ts`) — Vercel functions are stateless between invocations, so this is the only place a Google `syncToken`/`pageToken` survives across runs.
 
 | Column | Type | Notes |
 |---|---|---|

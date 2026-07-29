@@ -1,0 +1,19 @@
+{
+  "name": "ai-calendar-manager-extension",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@crxjs/vite-plugin": "^2.7.1",
+    "@types/chrome": "^0.2.2",
+    "typescript": "^5",
+    "vite": "^8.1.5",
+    "vitest": "^4.1.10",
+    "jsdom": "^30"
+  }
+}
